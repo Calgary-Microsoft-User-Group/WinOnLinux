@@ -1,0 +1,4 @@
+# Markdown is the entire content of this repository — keep line endings
+# identical in the index and in every working tree, on any platform, so
+# diffs stay free of whitespace-only noise.
+*.md text eol=lf
