@@ -4,25 +4,38 @@ Guidance for Claude Code working in this repository.
 
 ## What this repo is
 
-A **specification-only** repository for WinOnLinux — a Linux desktop client for Windows 365 Cloud PCs and
-Azure Virtual Desktop. There is **no application code yet**, and no build, test, or lint commands to run. Work here
-is document work: specifying, deciding, and recording.
+WinOnLinux — a Linux desktop client for Windows 365 Cloud PCs and Azure Virtual Desktop. The repo started as
+**specification-only** and is now transitioning into a **live coding repo**: `openspec/changes/` holds 10 OpenSpec
+change proposals (`add-app-foundation`, `add-auth-account-manager`, `add-avd-feed-provider`, `add-cloudpc-actions`,
+`add-cloudpc-enumeration`, `add-connection-config-provider`, `add-flatpak-packaging`, `add-native-launcher`,
+`add-ui-shell`, `add-web-launcher`), each with a `proposal.md`, `design.md`, `specs/` delta, and a `tasks.md` of real
+implementation tasks (Python/GTK4/FreeRDP code, tests, CI). As of 2026-09-14 none has been applied yet — no
+`src/` tree exists and there are still no build/test/lint commands to run — but do not assume "document work only":
+once a change is applied (see the `openspec-apply-change` skill), work in this repo includes writing and testing
+application code against that change's `tasks.md`, not just editing markdown. `spec.md` stays normative for
+requirements and decisions throughout; OpenSpec changes implement it, they don't replace it as the source of truth.
 
 ```
 spec.md                   The specification. §14 is the decision register — authoritative.
 gapsandrecommendations.md  Completeness/feasibility assessment: 54 findings (G-nn), applied + backlog.
 README.md                  Public-facing summary.
+openspec/changes/*/        OpenSpec change proposals decomposing spec.md into implementable units (see above).
 docs/superpowers/specs/2026-08-18-...-design.md
                            Original native-path design. Partly superseded by spec.md.
 ```
 
-Execution is tracked in **Linear**, deliberately split three ways:
+Execution is tracked in **Linear** — team `BigHatGroup` (workspace `linear.app/bighatgroup`), deliberately split four ways:
 
-| Project | Holds | Do not put |
+| Project (real Linear name) | Holds | Do not put |
 | --- | --- | --- |
-| Prerequisites | Tenant, licence, hardware, tooling procurement (E-1…E-11) | Spec or code work |
-| Implementation | Open specification and decision gaps (G-nn) | Procurement or execution |
-| Sprint 1 | The 5-day feasibility sprint (S-0…S-7, V3, LG-1) | Anything beyond the sprint |
+| `WindowsAppforLinuxPrereq` | Tenant, licence, hardware, tooling procurement (E-1…E-11) | Spec or code work |
+| `WindowsAppForLinuxImpl` | Open specification and decision gaps (G-nn) | Procurement or execution |
+| `WindowsAppForLinuxSprint1` | The 5-day feasibility sprint (S-0…S-7, V3, LG-1) | Anything beyond the sprint |
+| `WinOnLinuxCode` | Application code, one issue per OpenSpec change under `openspec/changes/` (10/10 filed as of 2026-09-15); ordering enforced by Linear blocking relations, Phase 1 issues titled `(GATED: Stage 0/1, LG-1)` | Spec/decision gaps or procurement |
+
+Older references to "Prerequisites", "Implementation", and "Sprint 1" project names elsewhere (including earlier in this file's history) mean
+`WindowsAppforLinuxPrereq`, `WindowsAppForLinuxImpl`, and `WindowsAppForLinuxSprint1` respectively — those are the actual Linear project
+names to use when searching, filtering, or linking issues.
 
 ## The five technical facts most easily got wrong
 
