@@ -1,0 +1,41 @@
+schema: spec-driven
+
+context: |
+  WinOnLinux — a Linux desktop client for Windows 365 Cloud PCs and Azure Virtual Desktop.
+  spec.md is the normative specification; its §14 decision register (D-1…D-20) is authoritative — do not
+  re-argue decided items, cite their IDs. Stack (decided): Python 3 + GTK4/libadwaita (D-16), MSAL Python
+  (D-17), asyncio (D-18), FreeRDP ≥ 3.30.0 as an xfreerdp subprocess (D-1, D-20), Flatpak primary (D-3),
+  keyring required with no file fallback (D-2), Apache-2.0 (D-12).
+  FreeRDP already does everything below the connection config (Entra auth, ARM gateway, reverse connect,
+  RDP/RDSTLS) — never propose reimplementing it. The native-path gap is one call chain: feed discovery →
+  workspace feed download → compose a .rdpw, validated per §10.1 (host allowlist, field validation; the
+  .rdpw signature is not a trust control).
+  Native-path changes are gated: Stage 0 identity spike (D-14, 3-day timebox), Gate LG-1 legal review,
+  Stage 1 feed schema capture. A negative gate result means web-only MVP, not a workaround.
+  Execution is tracked in Linear (team BigHatGroup); keep spec.md §14 and Linear in sync.
+
+rules:
+  specs:
+    - Derive scenarios from spec.md acceptance criteria (FR-n-AC-m) and cite them
+    - Distinguish verified vs decided-but-unverified vs assumed facts
+  tasks:
+    - Native-path changes start with gate-precondition tasks (Stage 0/1 outputs exist)
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+# Example:
+#   context: |
+#     Tech stack: TypeScript, React, Node.js
+#     We use conventional commits
+#     Domain: e-commerce platform
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
