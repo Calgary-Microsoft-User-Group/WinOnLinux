@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Minimal system packages needed for PyGObject to build/import GTK4 and
+      # libadwaita bindings: GI typelibs for Gtk 4 and Adw 1, the GObject
+      # Introspection headers PyGObject's build needs, and python3-gi as a
+      # fallback if the pip build needs a system gi. No display server
+      # (xvfb) is installed on purpose: unit tests must not need one
+      # per spec.md section 13.4.
+      - name: Install GTK4/libadwaita GI typelibs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgirepository1.0-dev \
+            gir1.2-gtk-4.0 \
+            gir1.2-adw-1 \
+            python3-gi
+
+      - name: Install project with test extras
+        run: python -m pip install -e ".[test]"
+
+      - name: Run tests
+        run: python -m pytest

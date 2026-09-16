@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "winonlinux"
+version = "0.1.0"
+description = "Linux desktop client for Windows 365 Cloud PCs and Azure Virtual Desktop"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [
+    { name = "Calgary Microsoft User Group" },
+]
+dependencies = [
+    "pygobject",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/winonlinux"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: fast, hermetic tests with no network, no real tenant, and no display server (CI default)",
+    "live: opt-in tests needing network, a real tenant, or a display server; excluded from CI by default per spec.md section 13.4",
+]
+addopts = "-m unit"
