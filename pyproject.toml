@@ -14,6 +14,13 @@ authors = [
 ]
 dependencies = [
     "pygobject",
+    "msal>=1.28.0",
+    "msal-extensions>=1.1.0",
+    # msal itself depends on requests transitively, but winonlinux.auth_manager imports and
+    # catches requests.exceptions.RequestException directly (network-error classification for
+    # FR-4-AC-5's Offline state), so it is declared explicitly here rather than relied on as an
+    # undeclared transitive dependency.
+    "requests>=2.27.0",
 ]
 
 [project.optional-dependencies]

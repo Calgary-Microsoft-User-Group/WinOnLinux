@@ -4,7 +4,9 @@ Implements the "Single application instance" requirement (spec.md, add-app-found
 FR-4-AC-7, §6.3) and wires in the other pieces this change adds: the GLib<->asyncio bridge
 (``winonlinux.asyncio_bridge``, D-18), the per-account task-group registry
 (``winonlinux.task_registry``), the FreeRDP version probe (``winonlinux.freerdp_probe``, NFR-8),
-and the non-secret state store (``winonlinux.state_store``, D-13).
+and the non-secret state store (``winonlinux.state_store``, D-13). Also constructs and starts the
+Auth/Account Manager (``winonlinux.auth_manager``, add-auth-account-manager change) -- see
+``_first_activate`` and ``_start_auth_manager`` below.
 
 Single-instance behavior comes for free from ``Gio.Application``/``Adw.Application``: an
 application ID plus the *default* ``Gio.ApplicationFlags`` (i.e. NOT
@@ -36,6 +38,8 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, Gtk  # noqa: E402  (require_version must precede this import)
 
 from winonlinux import asyncio_bridge
+from winonlinux.auth_cache import KeyringUnavailable
+from winonlinux.auth_manager import AuthManager
 from winonlinux.freerdp_probe import FreeRdpProbeResult
 from winonlinux.freerdp_probe import probe as probe_freerdp
 from winonlinux.state_store import StateStore
@@ -99,6 +103,28 @@ class WinOnLinuxApplication(Adw.Application):
         #: not just I/O, waits until inside ``_first_activate``.
         self.state_store: StateStore | None = None
 
+        #: The auth/account manager (add-auth-account-manager change). Constructed synchronously
+        #: inside ``_first_activate`` -- immediately after ``self.task_registry`` -- so other code
+        #: can reach ``self.auth_manager`` (e.g. to read ``.accounts``) even before its async
+        #: ``start()`` has finished; ``start()`` itself is scheduled as a background task and never
+        #: awaited here (see ``_first_activate`` and ``_start_auth_manager`` below). ``None`` only
+        #: before the single-instance check confirms this process is primary, matching
+        #: ``state_store``'s and the FreeRDP probe's discipline.
+        self.auth_manager: AuthManager | None = None
+
+        #: Populated only if the scheduled ``_start_auth_manager`` task fails -- most notably with
+        #: :class:`~winonlinux.auth_cache.KeyringUnavailable` (D-2: no usable OS keyring, sign-in
+        #: must be refused with no fallback). ``winonlinux.task_registry.TaskRegistry`` has no
+        #: built-in convention for surfacing a background task's exception (a task's done-callback
+        #: only discards it from the tracked set -- see task_registry.py); this attribute is where
+        #: that exception is stashed instead of letting it disappear silently, following the same
+        #: "stash the async result on the application instance, `None` means not finished yet"
+        #: pattern already used for ``freerdp_probe_result``. A future UI-shell change reads this
+        #: (or catches it live via a comment/notification path of its own) to show the D-2 refusal
+        #: state (spec.md's "plain explanation, sign-in disabled, no fallback") -- presenting that
+        #: UI is out of scope for this change (see auth_manager.py's own docstring).
+        self.auth_manager_start_error: BaseException | None = None
+
         self.connect("activate", self._on_activate)
 
     # -- signal handlers -----------------------------------------------------
@@ -141,6 +167,17 @@ class WinOnLinuxApplication(Adw.Application):
         asyncio_bridge.install()
         self.task_registry = TaskRegistry()
 
+        # Auth/Account Manager (add-auth-account-manager change). Constructed synchronously, right
+        # here, so self.auth_manager is reachable immediately -- but its async start() (keyring
+        # build + cached-account enumeration, both potentially slow I/O) is only *scheduled* below,
+        # under the app-scoped task group, exactly like the FreeRDP probe: never awaited inline, so
+        # a slow or unavailable keyring cannot delay window creation or the NFR-1 cold-start
+        # measurement.
+        self.auth_manager = AuthManager(task_registry=self.task_registry)
+        self.task_registry.get_or_create_group().create_task(
+            self._start_auth_manager(), name="auth-manager-start"
+        )
+
         # Non-secret state store (D-13). Construction alone does no I/O -- StateStore.load()/
         # .save() are the operations that touch disk -- but it is still built only here, inside
         # the primary instance's one-time setup, rather than at __init__ time, matching the same
@@ -181,6 +218,41 @@ class WinOnLinuxApplication(Adw.Application):
             result.version,
             result.meets_floor,
         )
+
+    async def _start_auth_manager(self) -> None:
+        """Run ``self.auth_manager.start()`` and never let its exception disappear silently.
+
+        Runs under the app-scoped task group (see :meth:`_first_activate`); never awaited by
+        startup itself, so keyring I/O or MSAL setup work cannot delay the interactive window.
+
+        ``winonlinux.task_registry.TaskRegistry`` has no built-in convention for surfacing a
+        background task's exception -- a task's done-callback only discards it from the tracked
+        set (see task_registry.py's ``_discard``) -- so this method follows the same convention
+        ``_run_freerdp_probe`` uses for its *result*: catch here, stash the outcome on the
+        application instance, log it, and let readers poll the attribute rather than relying on an
+        unhandled-exception warning from asyncio's default task-exception logging.
+
+        :class:`~winonlinux.auth_cache.KeyringUnavailable` (D-2: no usable OS Secret Service) is
+        the specific, expected failure mode -- logged at WARNING, since it is not a bug, it is the
+        documented no-fallback refusal state. Anything else is logged at ERROR with a traceback,
+        since ``AuthManager.start()`` is not otherwise expected to raise. Either way the exception
+        is stashed on :attr:`auth_manager_start_error` (``None`` while this task is still running
+        or once it has succeeded) rather than propagated -- there is no caller here to catch it,
+        and letting it escape this task would only produce asyncio's generic "exception was never
+        retrieved" warning instead of an actionable log line.
+        """
+        try:
+            await self.auth_manager.start()
+        except KeyringUnavailable as exc:
+            self.auth_manager_start_error = exc
+            logger.warning(
+                "AuthManager.start() found no usable OS keyring (D-2 refusal state: sign-in is "
+                "disabled, there is no fallback): %s",
+                exc,
+            )
+        except Exception as exc:  # noqa: BLE001 - deliberately broad: never let this disappear
+            self.auth_manager_start_error = exc
+            logger.error("AuthManager.start() failed unexpectedly", exc_info=True)
 
     def do_shutdown(self) -> None:
         """Tear down the asyncio bridge cleanly when the application quits."""
