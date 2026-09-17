@@ -6,7 +6,11 @@ FR-4-AC-7, §6.3) and wires in the other pieces this change adds: the GLib<->asy
 (``winonlinux.task_registry``), the FreeRDP version probe (``winonlinux.freerdp_probe``, NFR-8),
 and the non-secret state store (``winonlinux.state_store``, D-13). Also constructs and starts the
 Auth/Account Manager (``winonlinux.auth_manager``, add-auth-account-manager change) -- see
-``_first_activate`` and ``_start_auth_manager`` below.
+``_first_activate`` and ``_start_auth_manager`` below -- and registers an active-account listener
+that starts CloudPC polling and runs an initial enumeration (``winonlinux.cloudpc_provider``,
+add-cloudpc-enumeration change) every time ``AuthManager`` establishes or changes the active
+account -- on startup rebuild, on the first interactive sign-in, and on every account switch -- see
+``_on_active_account_changed`` below.
 
 Single-instance behavior comes for free from ``Gio.Application``/``Adw.Application``: an
 application ID plus the *default* ``Gio.ApplicationFlags`` (i.e. NOT
@@ -40,6 +44,8 @@ from gi.repository import Adw, Gio, Gtk  # noqa: E402  (require_version must pre
 from winonlinux import asyncio_bridge
 from winonlinux.auth_cache import KeyringUnavailable
 from winonlinux.auth_manager import AuthManager
+from winonlinux.avd_bookmarks import BookmarkStore
+from winonlinux.cloudpc_provider import CloudPcProvider
 from winonlinux.freerdp_probe import FreeRdpProbeResult
 from winonlinux.freerdp_probe import probe as probe_freerdp
 from winonlinux.state_store import StateStore
@@ -125,6 +131,21 @@ class WinOnLinuxApplication(Adw.Application):
         #: UI is out of scope for this change (see auth_manager.py's own docstring).
         self.auth_manager_start_error: BaseException | None = None
 
+        #: Windows 365 Cloud PC enumeration/refresh provider (add-cloudpc-enumeration change).
+        #: Constructed synchronously inside ``_first_activate``, immediately after
+        #: ``self.auth_manager`` -- construction alone does no I/O (no Graph call, no polling
+        #: task) -- matching every other attribute's "construct here, do I/O later" discipline in
+        #: this method. ``None`` only before the single-instance check confirms this process is
+        #: primary. See ``_start_auth_manager`` for when polling/the first refresh actually start.
+        self.cloudpc_provider: CloudPcProvider | None = None
+
+        #: Phase 0 AVD bookmark store (add-cloudpc-enumeration change, spec.md section 11).
+        #: Constructed synchronously alongside ``cloudpc_provider`` -- construction alone does no
+        #: I/O; ``BookmarkStore.load()`` is not called here (that is a future UI-shell change's
+        #: job, when it has somewhere to render the result). ``None`` until the single-instance
+        #: check confirms this process is primary.
+        self.avd_bookmarks: BookmarkStore | None = None
+
         self.connect("activate", self._on_activate)
 
     # -- signal handlers -----------------------------------------------------
@@ -174,6 +195,21 @@ class WinOnLinuxApplication(Adw.Application):
         # a slow or unavailable keyring cannot delay window creation or the NFR-1 cold-start
         # measurement.
         self.auth_manager = AuthManager(task_registry=self.task_registry)
+
+        # CloudPC provider + Phase 0 AVD bookmarks (add-cloudpc-enumeration change). Constructed
+        # synchronously, right here, immediately after self.auth_manager -- construction alone
+        # does no I/O (no Graph call, no polling task, no BookmarkStore.load()), matching this
+        # method's "construct now, do I/O later" discipline for every other attribute above.
+        self.cloudpc_provider = CloudPcProvider(
+            auth_manager=self.auth_manager, task_registry=self.task_registry
+        )
+        self.avd_bookmarks = BookmarkStore()
+
+        # Registered BEFORE auth_manager.start() is scheduled below, so the startup-rebuild case
+        # (a cached account made active inside start() itself) fires this listener too, uniformly
+        # with a later interactive sign-in or account switch -- see _on_active_account_changed.
+        self.auth_manager.add_active_account_listener(self._on_active_account_changed)
+
         self.task_registry.get_or_create_group().create_task(
             self._start_auth_manager(), name="auth-manager-start"
         )
@@ -240,6 +276,7 @@ class WinOnLinuxApplication(Adw.Application):
         or once it has succeeded) rather than propagated -- there is no caller here to catch it,
         and letting it escape this task would only produce asyncio's generic "exception was never
         retrieved" warning instead of an actionable log line.
+
         """
         try:
             await self.auth_manager.start()
@@ -253,6 +290,60 @@ class WinOnLinuxApplication(Adw.Application):
         except Exception as exc:  # noqa: BLE001 - deliberately broad: never let this disappear
             self.auth_manager_start_error = exc
             logger.error("AuthManager.start() failed unexpectedly", exc_info=True)
+        # No further action here: if start() resolved an active account, it already called the
+        # _on_active_account_changed listener registered in _first_activate synchronously, before
+        # this coroutine even resumes -- see AuthManager.start()'s own _notify_active_account_changed
+        # call and this class's _on_active_account_changed below.
+
+    def _on_active_account_changed(self, home_account_id: str) -> None:
+        """Registered on :attr:`auth_manager` in :meth:`_first_activate` via
+        ``AuthManager.add_active_account_listener`` (add-cloudpc-enumeration change, tasks.md 3.1).
+
+        Fires synchronously, from inside ``AuthManager``, in exactly three cases: ``start()``'s
+        startup rebuild resolving a cached account as active, ``add_account()`` establishing the
+        very first account, and every ``switch_active_account()`` call that actually changes the
+        active account (called there *after* the outgoing account's task group has already been
+        cancelled -- see ``switch_active_account``'s own comment on that ordering). This covers
+        "sign-in" and "account switch", two of tasks.md 3.1's three named triggers; "manual
+        refresh" still has no UI control to invoke it from and remains a future UI-shell change's
+        job to wire directly to ``cloudpc_provider.refresh_now``.
+
+        Schedules the actual work under ``home_account_id``'s OWN task group -- not awaited here,
+        since this callback itself runs synchronously inside ``AuthManager`` and must return
+        immediately -- so that a later switch away from this account cancels it via the same
+        ``task_registry.cancel_group`` mechanism ``switch_active_account`` already uses (FR-3-AC-2).
+        """
+        self.task_registry.get_or_create_group(home_account_id).create_task(
+            self._enumerate_active_account(home_account_id), name="cloudpc-enumerate-on-account-change"
+        )
+
+    async def _enumerate_active_account(self, home_account_id: str) -> None:
+        """Start CloudPC polling and run one enumeration for ``home_account_id``.
+
+        Runs under ``home_account_id``'s own task group (see :meth:`_on_active_account_changed`),
+        so it is cancelled automatically if the active account changes again before it finishes.
+
+        The :meth:`CloudPcProvider.refresh_now` call is awaited (not fire-and-forgotten) so
+        ``self.cloudpc_provider.last_result`` is populated by the time this task completes -- but
+        any exception it raises (including an ``AuthError`` subclass propagating straight out of
+        ``refresh_now``, e.g. ``ReauthRequiredError`` for a cached account whose refresh token has
+        since been revoked) is caught and logged here rather than left to asyncio's generic
+        "exception was never retrieved" task-exception warning: ``last_result`` already carries a
+        typed outcome for a future UI to read (or stays whatever it was before, if this call
+        raised before producing a new one), and there is no caller here that could usefully react
+        to the exception itself.
+        """
+        self.cloudpc_provider.start_polling(home_account_id)
+        try:
+            await self.cloudpc_provider.refresh_now(home_account_id)
+        except Exception as exc:  # noqa: BLE001 - deliberately broad, see docstring
+            logger.warning(
+                "CloudPC enumeration for account %s failed (%s); cloudpc_provider.last_result "
+                "reflects whatever outcome was produced, if any",
+                home_account_id,
+                type(exc).__name__,
+                exc_info=True,
+            )
 
     def do_shutdown(self) -> None:
         """Tear down the asyncio bridge cleanly when the application quits."""

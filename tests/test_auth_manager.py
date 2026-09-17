@@ -388,6 +388,92 @@ def test_switch_active_account_to_already_active_is_a_noop():
     asyncio.run(scenario())
 
 
+# --- active-account listeners (tasks.md 3.1, add-cloudpc-enumeration) ---------------------------
+
+
+def test_switch_active_account_notifies_listeners_after_cancelling_the_old_group():
+    async def scenario():
+        manager, task_registry = _make_manager()
+        _seeded_account(manager, "acct-a")
+        _seeded_account(manager, "acct-b")
+        manager.active_account_id = "acct-a"
+
+        calls = []
+        # Record whether cancel_group had already run when the listener fires -- the notification
+        # must happen AFTER cancellation, not before (a listener that schedules new work under
+        # task_registry must never race the old group's cancellation).
+        manager.add_active_account_listener(
+            lambda account_id: calls.append((account_id, list(task_registry.cancel_group_calls)))
+        )
+
+        await manager.switch_active_account("acct-b")
+
+        assert calls == [("acct-b", ["acct-a"])]
+
+    asyncio.run(scenario())
+
+
+def test_switch_active_account_to_already_active_does_not_notify():
+    async def scenario():
+        manager, _ = _make_manager()
+        _seeded_account(manager, "acct-a")
+        manager.active_account_id = "acct-a"
+        calls = []
+        manager.add_active_account_listener(calls.append)
+
+        await manager.switch_active_account("acct-a")
+
+        assert calls == []
+
+    asyncio.run(scenario())
+
+
+def test_add_account_notifies_listeners_only_for_the_first_account(monkeypatch):
+    async def scenario():
+        app = FakeMsalApp()
+        manager, _ = _make_manager(app)
+        monkeypatch.setattr(auth_manager, "LoopbackListener", FakeLoopbackListener)
+        monkeypatch.setattr(auth_manager.webbrowser, "open", lambda *a, **k: True)
+
+        calls = []
+        manager.add_active_account_listener(calls.append)
+
+        app.acquire_by_code_flow_result = {
+            "access_token": FAKE_ACCESS_TOKEN,
+            "id_token_claims": {"oid": "oid-1", "tid": "tid-1", "preferred_username": "a@contoso.com"},
+        }
+        FakeLoopbackListener.outcome = LoopbackResult(query_params={"code": "c1", "state": "the-expected-state"})
+        first_id = await manager.add_account()
+        assert calls == [first_id]
+
+        app.acquire_by_code_flow_result = {
+            "access_token": FAKE_ACCESS_TOKEN,
+            "id_token_claims": {"oid": "oid-2", "tid": "tid-1", "preferred_username": "b@contoso.com"},
+        }
+        FakeLoopbackListener.outcome = LoopbackResult(query_params={"code": "c2", "state": "the-expected-state"})
+        await manager.add_account()
+        # Still just the one call from the first account -- adding a second must not notify.
+        assert calls == [first_id]
+
+    asyncio.run(scenario())
+
+
+def test_active_account_listener_exception_does_not_break_switch(caplog):
+    async def scenario():
+        manager, _ = _make_manager()
+        _seeded_account(manager, "acct-a")
+        _seeded_account(manager, "acct-b")
+        manager.active_account_id = "acct-a"
+        manager.add_active_account_listener(lambda account_id: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        with caplog.at_level(logging.ERROR):
+            await manager.switch_active_account("acct-b")  # must not raise
+
+        assert manager.active_account_id == "acct-b"
+
+    asyncio.run(scenario())
+
+
 # --- 5.3: sign_out -----------------------------------------------------------------------------
 
 

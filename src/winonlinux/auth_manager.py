@@ -57,7 +57,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import webbrowser
-from typing import Any, NoReturn
+from typing import Any, Callable, NoReturn
 
 import msal
 import requests
@@ -258,6 +258,33 @@ class AuthManager:
         self._silent_locks: dict[tuple[str, tuple[str, ...]], asyncio.Lock] = {}
         self._silent_inflight: dict[tuple[str, tuple[str, ...]], "asyncio.Future[str]"] = {}
 
+        # tasks.md 3.1 (add-cloudpc-enumeration) needs a way to react to "the active account is
+        # now X" without AuthManager knowing anything about CloudPcProvider or any other consumer
+        # -- a plain observer list, notified synchronously from start()/add_account()/
+        # switch_active_account() whenever active_account_id is established or changes. A listener
+        # is expected to do its own real work (if any) via task_registry.create_task, not block
+        # this synchronous notification.
+        self._active_account_listeners: list["Callable[[str], None]"] = []
+
+    def add_active_account_listener(self, callback: "Callable[[str], None]") -> None:
+        """Register ``callback(home_account_id)`` to be called whenever the active account is
+        established or changes: on :meth:`start`'s startup rebuild (if any cached account exists),
+        on :meth:`add_account` establishing the very first account, and on every
+        :meth:`switch_active_account` call that actually changes the active account. Exceptions a
+        callback raises are caught and logged here, never allowed to break the auth flow that
+        triggered the notification."""
+        self._active_account_listeners.append(callback)
+
+    def _notify_active_account_changed(self, home_account_id: str) -> None:
+        for callback in list(self._active_account_listeners):
+            try:
+                callback(home_account_id)
+            except Exception:  # noqa: BLE001 - a listener's own bug must never break auth flow
+                logger.exception(
+                    "an active-account listener raised while handling account %s",
+                    home_account_id,
+                )
+
     # -- startup --------------------------------------------------------------------------------
 
     async def start(self) -> None:
@@ -303,6 +330,8 @@ class AuthManager:
                 self.active_account_id = home_account_id
 
         logger.info("AuthManager.start: rebuilt %d cached account(s) from the keyring", len(self.accounts))
+        if self.active_account_id is not None:
+            self._notify_active_account_changed(self.active_account_id)
 
     # -- add / switch / sign out ------------------------------------------------------------------
 
@@ -345,6 +374,7 @@ class AuthManager:
         # active_account_id when this is literally the first account ever added.
         if len(self.accounts) == 1:
             self.active_account_id = home_account_id
+            self._notify_active_account_changed(home_account_id)
 
         logger.info("add_account: signed in new account %s", home_account_id)
         return home_account_id
@@ -366,6 +396,11 @@ class AuthManager:
         logger.info(
             "switch_active_account: %s -> %s", previous_account_id, home_account_id
         )
+        # Cancel-then-notify, in that order: a listener reacting to this (e.g. CloudPcProvider
+        # starting the new account's enumeration) must run after the old account's task group has
+        # already been cancelled above, not before -- otherwise a listener that schedules work
+        # under task_registry could race the cancellation.
+        self._notify_active_account_changed(home_account_id)
 
     async def sign_out(self, home_account_id: str) -> None:
         """Remove ``home_account_id``'s cache entries and local state (FR-3-AC-3). Every other

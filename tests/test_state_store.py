@@ -275,6 +275,19 @@ def test_save_accepts_short_non_secret_string_under_innocuous_key(tmp_path):
     assert store.path.exists()
 
 
+def test_save_accepts_a_bare_guid_under_an_innocuous_key(tmp_path):
+    # Regression test: a canonical UUID (36 chars, all hex + hyphens) otherwise matches the
+    # opaque-token fallback's charset and 32+-char floor, but Azure/Graph resource, tenant, and
+    # object identifiers are routinely bare GUIDs under keys like "workspaceId"/"resourceId" --
+    # legitimate, non-secret data this store must be able to persist. A real opaque bearer/refresh
+    # token is a contiguous base64url run, not this specific 8-4-4-4-12 dash grouping.
+    store = _store(tmp_path, schema_version=1, defaults={})
+    store.save({"workspaceId": "9c495a02-4d4c-4f2a-8c8e-2b2c9e2f2222"})
+    assert store.path.exists()
+    reloaded = StateStore("test-store", schema_version=1, state_home=store._state_home).load()
+    assert reloaded["workspaceId"] == "9c495a02-4d4c-4f2a-8c8e-2b2c9e2f2222"
+
+
 def test_save_refuses_explicit_secret_wrapper(tmp_path, caplog):
     store = _store(tmp_path, schema_version=1)
     payload = {"someField": Secret("do-not-persist-me")}

@@ -100,6 +100,18 @@ and desktop proxy settings), and proxy failures SHALL be reported distinguishabl
 - **THEN** Graph requests route through it, and a proxy rejection is reported naming the proxy as the cause rather
   than as "offline"
 
+### Requirement: Consent-required is distinguished from a generic failure
+
+Graph `403` on `/me/cloudPCs` (tenant admin consent missing) SHALL be surfaced as a distinct result, separate from
+both the ordinary transport/5xx `Failed` case and the no-licence `404` case, so the UI can offer the guided
+admin-consent flow rather than a generic "refresh failed" error (closes G-42).
+
+#### Scenario: Consent required
+
+- **WHEN** enumeration returns HTTP `403`
+- **THEN** a distinct consent-required result is surfaced, not treated as an ordinary `Failed` error and not
+  conflated with the no-licence `404` state
+
 ### Requirement: Phase 0 AVD entries come from admin-provisioned bookmarks
 
 Until feed enumeration lands, AVD entries SHALL appear only for admin-provisioned workspace/resource IDs

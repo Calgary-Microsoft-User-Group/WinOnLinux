@@ -65,6 +65,16 @@ _JWT_LIKE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0
 # equivalent fallback, to catch exactly this shape even under a key name the pattern above misses.
 _OPAQUE_TOKEN_LIKE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,}$")
 
+# A canonical UUID (8-4-4-4-12 hex, hyphenated) is EXCLUDED from the opaque-token check above,
+# even though its 36 characters otherwise match that pattern's charset and length floor. Azure/
+# Graph resource, tenant, and object identifiers are routinely bare GUIDs (workspaceId, resourceId,
+# tenant id, etc.) and are legitimate, non-secret data this store must be able to persist -- a real
+# opaque bearer/refresh token is a single contiguous base64url run and is not formatted with this
+# specific dash grouping, so this carve-out does not meaningfully widen what the heuristic misses.
+_UUID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
 #: A migration step: takes the store dict as it existed at ``schemaVersion == from_version`` and
 #: returns the dict upgraded to ``from_version + 1``. Must carry forward every field it does not
 #: intentionally drop -- migrations are forward-only, so this is the only chance to preserve data.
@@ -115,7 +125,8 @@ def _find_secret(value: Any, key_path: str = "$") -> tuple[str, Any] | None:
         return None
 
     if isinstance(value, str) and (
-        _JWT_LIKE_PATTERN.match(value) or _OPAQUE_TOKEN_LIKE_PATTERN.match(value)
+        _JWT_LIKE_PATTERN.match(value)
+        or (_OPAQUE_TOKEN_LIKE_PATTERN.match(value) and not _UUID_PATTERN.match(value))
     ):
         return key_path, value
 
