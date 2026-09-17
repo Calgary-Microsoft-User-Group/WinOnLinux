@@ -1,0 +1,112 @@
+#cloud-config
+# WinOnLinux dev VM provisioning: GNOME desktop over xrdp + the D-16/D-17/D-2/D-3 dev stack.
+# Desktop install is large; first boot takes ~10-20 minutes. Check with: cloud-init status --wait
+
+package_update: true
+package_upgrade: false
+
+packages:
+  # Desktop + remote access (xrdp sessions are Xorg — the Phase 1 reference platform)
+  - ubuntu-desktop-minimal
+  - xrdp
+  - xorgxrdp
+  # Python / GTK4 / libadwaita stack (D-16)
+  - python3-pip
+  - python3-venv
+  - python3-gi
+  - python3-gi-cairo
+  - gir1.2-gtk-4.0
+  - gir1.2-adw-1
+  - libgtk-4-dev
+  - libadwaita-1-dev
+  # Keyring / Secret Service (D-2)
+  - gnome-keyring
+  - libsecret-1-0
+  - libsecret-tools
+  - seahorse
+  # Packaging (D-3)
+  - flatpak
+  - flatpak-builder
+  # General tooling
+  - git
+  - curl
+  - jq
+  - htop
+  # FreeRDP 3.x build dependencies (distro xfreerdp is too old; build 3.30.0+ from source — see README)
+  - build-essential
+  - cmake
+  - ninja-build
+  - pkg-config
+  - libssl-dev
+  - libx11-dev
+  - libxext-dev
+  - libxinerama-dev
+  - libxcursor-dev
+  - libxdamage-dev
+  - libxv-dev
+  - libxkbfile-dev
+  - libxrandr-dev
+  - libxi-dev
+  - libxrender-dev
+  - libxfixes-dev
+  - libxtst-dev
+  - libasound2-dev
+  - libpulse-dev
+  - libcups2-dev
+  - libxml2-dev
+  - libfuse3-dev
+  - libusb-1.0-0-dev
+  - uuid-dev
+  - libpam0g-dev
+  - libkrb5-dev
+  - libcjson-dev
+  - libswscale-dev
+  - libavutil-dev
+  - libavcodec-dev
+  - libswresample-dev
+
+write_files:
+  # The desktop install pulls in NetworkManager, whose netplan default tries to take over all
+  # devices and can leave eth0 unmanaged (dead network, unreachable VM). Pin eth0 to networkd.
+  - path: /etc/netplan/90-eth0-networkd.yaml
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          eth0:
+            dhcp4: true
+  # xrdp/GNOME sessions trigger colord polkit auth prompts that break login; allow them for sudoers.
+  - path: /etc/polkit-1/rules.d/45-allow-colord.rules
+    content: |
+      polkit.addRule(function(action, subject) {
+        if ((action.id == "org.freedesktop.color-manager.create-device" ||
+             action.id == "org.freedesktop.color-manager.create-profile" ||
+             action.id == "org.freedesktop.color-manager.delete-device" ||
+             action.id == "org.freedesktop.color-manager.delete-profile" ||
+             action.id == "org.freedesktop.color-manager.modify-device" ||
+             action.id == "org.freedesktop.color-manager.modify-profile") &&
+            subject.isInGroup("sudo")) {
+          return polkit.Result.YES;
+        }
+      });
+
+runcmd:
+  - adduser xrdp ssl-cert
+  # Unlock GNOME Keyring automatically at xrdp login (D-2: keyring required, no file fallback)
+  - |
+    grep -q pam_gnome_keyring /etc/pam.d/xrdp-sesman || cat >> /etc/pam.d/xrdp-sesman <<'EOF'
+    auth      optional  pam_gnome_keyring.so
+    session   optional  pam_gnome_keyring.so auto_start
+    EOF
+  # Make xrdp launch the full Ubuntu GNOME session
+  - |
+    grep -q GNOME_SHELL_SESSION_MODE /etc/xrdp/startwm.sh || sed -i 's|^test -x /etc/X11/Xsession|export GNOME_SHELL_SESSION_MODE=ubuntu\nexport XDG_CURRENT_DESKTOP=ubuntu:GNOME\nexport XDG_SESSION_DESKTOP=ubuntu\nexport DESKTOP_SESSION=ubuntu\ntest -x /etc/X11/Xsession|' /etc/xrdp/startwm.sh
+  - netplan apply
+  - flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+  - systemctl set-default graphical.target
+  - systemctl enable xrdp
+  - systemctl restart xrdp
+
+final_message: "WinOnLinux dev VM provisioning complete after $UPTIME seconds. RDP to port 3389."
