@@ -450,3 +450,48 @@ def test_refresh_after_action_delegates_to_refresh_now(monkeypatch):
 
     assert isinstance(result, Empty)
     assert provider.last_result is result
+
+
+# --- malformed 200 payloads stay inside the typed taxonomy (fix-graph-hardening, audit F-03) -----
+
+
+def test_entry_missing_id_yields_failed_not_keyerror(monkeypatch):
+    """One malformed entry fails the whole refresh as a typed Failed (previous entries retained,
+    last_result untouched) -- never an untyped KeyError escaping to the caller or poll loop."""
+    good_page = _load_fixture("cloudpcs_page2.json")  # single page, no @odata.nextLink
+    malformed_page = {"value": [{"displayName": "No-Id PC", "status": "provisioned"}]}
+    calls = {"count": 0}
+
+    async def fake_graph_get_json(url, **kwargs):
+        calls["count"] += 1
+        return good_page if calls["count"] == 1 else malformed_page
+
+    monkeypatch.setattr(cloudpc_provider.graph_client, "graph_get_json", fake_graph_get_json)
+    provider = _make_provider()
+
+    first = asyncio.run(provider.refresh_now(FAKE_ACCOUNT))
+    assert isinstance(first, Enumerated)
+
+    second = asyncio.run(provider.refresh_now(FAKE_ACCOUNT))
+
+    assert isinstance(second, Failed)
+    assert isinstance(second.error, KeyError)
+    assert second.previous_entries == first.entries
+    assert provider.last_result is first
+
+
+def test_non_list_value_yields_failed(monkeypatch):
+    """A 200 page whose 'value' is not a list (contract change) surfaces as Failed, not an
+    untyped TypeError."""
+
+    async def fake_graph_get_json(url, **kwargs):
+        return {"value": {"id": "cpc-not-a-list"}}
+
+    monkeypatch.setattr(cloudpc_provider.graph_client, "graph_get_json", fake_graph_get_json)
+    provider = _make_provider()
+
+    result = asyncio.run(provider.refresh_now(FAKE_ACCOUNT))
+
+    assert isinstance(result, Failed)
+    assert isinstance(result.error, TypeError)
+    assert result.previous_entries == []

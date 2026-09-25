@@ -101,7 +101,9 @@ def _entry_from_raw(raw: dict) -> CloudPcEntry:
     ``raw["id"]`` is accessed directly (not ``.get``) and deliberately allowed to raise
     ``KeyError`` if Graph ever omits it: silently substituting a placeholder identifier here would
     be far worse than a loud failure, since ``id`` is the sole identifier every downstream action
-    (web launch, FR-5 actions) trusts with no second lookup (FR-1-AC-2).
+    (web launch, FR-5 actions) trusts with no second lookup (FR-1-AC-2). ``refresh_now`` converts
+    that loud failure into a typed :class:`Failed` (fix-graph-hardening, audit F-03) rather than
+    letting it escape untyped.
     """
     return CloudPcEntry(
         id=raw["id"],
@@ -230,6 +232,9 @@ class CloudPcProvider:
         - Any other ``graph_client.GraphError`` (proxy/network/throttled/unclassified) ->
           :class:`Failed`, carrying whatever entries the last *successful* :class:`Enumerated`
           result held (``[]`` if there has never been one).
+        - A 200 page violating the documented shape (entry missing ``id``, non-list ``value``) ->
+          :class:`Failed` likewise, never an untyped ``KeyError``/``TypeError`` escaping to the
+          caller (spec.md §9 "beta contract change"; fix-graph-hardening, audit F-03).
 
         :attr:`last_result` is updated to the new result on every non-``Failed`` outcome, and left
         untouched on ``Failed`` -- so a subsequent failure's ``previous_entries`` is always derived
@@ -251,7 +256,12 @@ class CloudPcProvider:
                     home_account_id=home_account_id,
                     scopes=list(self._scopes),
                 )
-                entries.extend(_entry_from_raw(raw) for raw in page.get("value", []))
+                value = page.get("value", [])
+                if not isinstance(value, list):
+                    raise TypeError(
+                        f"/me/cloudPCs 'value' is {type(value).__name__}, not a list"
+                    )
+                entries.extend(_entry_from_raw(raw) for raw in value)
                 url = page.get("@odata.nextLink")
         except graph_client.GraphNotFound:
             logger.info("cloudpc_provider: account %s has no Cloud PC licence (404)", home_account_id)
@@ -271,6 +281,22 @@ class CloudPcProvider:
                 "cloudpc_provider: refresh for account %s failed (%s); keeping %d previous entr%s",
                 home_account_id,
                 type(exc).__name__,
+                len(previous),
+                "y" if len(previous) == 1 else "ies",
+            )
+            return Failed(error=exc, previous_entries=list(previous))
+        except (KeyError, TypeError, ValueError) as exc:
+            # A 200 page whose shape violates the documented /me/cloudPCs contract (entry missing
+            # `id`, non-list `value`, ...) must stay inside the typed result taxonomy -- spec.md §9
+            # "beta contract change" row (fix-graph-hardening, audit F-03). One malformed entry
+            # fails the whole refresh (never a partial Enumerated), previous entries retained.
+            previous = self.last_result.entries if isinstance(self.last_result, Enumerated) else []
+            logger.warning(
+                "cloudpc_provider: refresh for account %s hit an unexpected /me/cloudPCs shape "
+                "(%s: %s) -- possible Graph contract change; keeping %d previous entr%s",
+                home_account_id,
+                type(exc).__name__,
+                exc,
                 len(previous),
                 "y" if len(previous) == 1 else "ies",
             )

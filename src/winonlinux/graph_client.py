@@ -13,10 +13,18 @@ right, so no caller has to reimplement them:
   ``AuthManager.acquire_token_silently``'s own docstring). Any exception
   ``acquire_token_silently`` raises (one of ``AuthManager``'s ``AuthError`` subclasses) propagates
   completely unmodified -- this module never catches, wraps, or reclassifies it.
-- **`429` handling with no user-visible error on the first throttle** (spec.md §9). A `Retry-After`
-  header is honored when present (integer-seconds form only -- see the note below); otherwise
-  exponential backoff starting at 1s, doubling, capped at 30s. Only once ``max_retries`` throttled
-  attempts are exhausted does this surface as :class:`GraphThrottled`.
+- **URL validation before any token is attached** (fix-graph-hardening, audit F-01; spec.md §10.1
+  host-allowlist principle). Every URL -- including remote-supplied `@odata.nextLink` values fed
+  back in by paging callers -- must be a string with scheme ``https`` and host exactly
+  ``graph.microsoft.com``, checked BEFORE token acquisition. Anything else raises
+  :class:`GraphError` with no token ever acquired for the attempt.
+- **`429` and transient `5xx` handling with no user-visible error on the first failure**
+  (spec.md §9, as amended by fix-graph-hardening). A `Retry-After` header is honored when present
+  (integer-seconds form only -- see the note below), clamped to a 300s ceiling; otherwise
+  exponential backoff starting at 1s, doubling, capped at 30s. `502`/`503`/`504` retry within the
+  same budget; `500` fails fast (a server bug, not transience). Only once ``max_retries``
+  attempts are exhausted does this surface -- as :class:`GraphThrottled` for `429`, plain
+  :class:`GraphError` for `5xx`.
 - **Proxy failures reported distinctly from plain network failures** (spec.md §5.9). This module
   does not configure proxying itself -- ``requests`` already honors ``HTTP_PROXY``/``HTTPS_PROXY``/
   ``NO_PROXY`` and desktop proxy settings by default (``trust_env=True`` is the default for a bare
@@ -46,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 
@@ -71,6 +80,42 @@ _REQUEST_TIMEOUT_SECONDS = 30
 #: header (spec.md §9).
 _BACKOFF_INITIAL_SECONDS = 1.0
 _BACKOFF_CAP_SECONDS = 30.0
+
+#: Ceiling on an honored `Retry-After` value (fix-graph-hardening, audit F-17). A hostile or
+#: misconfigured header must not be able to park a refresh for its full stated duration.
+_RETRY_AFTER_CAP_SECONDS = 300.0
+
+#: Transient server statuses retried within the same backoff budget as `429` (spec.md §9 as
+#: amended by fix-graph-hardening, audit F-16). 500 is deliberately absent: it signals a server
+#: bug, not transience, and §9's taxonomy wants it surfaced immediately.
+_RETRYABLE_SERVER_STATUSES = frozenset({502, 503, 504})
+
+#: The only request target this module will attach a bearer token to (fix-graph-hardening, audit
+#: F-01; spec.md §10.1 host-allowlist principle). Exact match -- no suffix logic -- so lookalike
+#: hosts (``graph.microsoft.com.attacker.example``) die on exactness. `@odata.nextLink` values are
+#: remote-supplied and funnel back through :func:`graph_get_json`, so this one check covers them.
+_ALLOWED_URL_SCHEME = "https"
+_ALLOWED_URL_HOST = "graph.microsoft.com"
+
+
+def _validate_graph_url(url: object) -> None:
+    """Reject any URL a token must not be attached to, BEFORE a token is acquired for it.
+
+    Raises :class:`GraphError` unless ``url`` is a string with scheme ``https`` and hostname
+    exactly :data:`_ALLOWED_URL_HOST`. Remote-supplied values (nextLink pages) are the threat
+    model here: a tampered response body naming another host would otherwise receive a live
+    access token (audit finding F-01).
+    """
+    if not isinstance(url, str):
+        raise GraphError(
+            f"refusing non-string Graph URL of type {type(url).__name__}"
+        )
+    parts = urlsplit(url)
+    if parts.scheme != _ALLOWED_URL_SCHEME or parts.hostname != _ALLOWED_URL_HOST:
+        raise GraphError(
+            f"refusing Graph URL outside the allowlist (scheme={parts.scheme!r}, "
+            f"host={parts.hostname!r}); only {_ALLOWED_URL_SCHEME}://{_ALLOWED_URL_HOST} is permitted"
+        )
 
 
 class GraphError(Exception):
@@ -188,7 +233,13 @@ async def graph_get_json(
     Acquires a fresh token via ``auth_manager.acquire_token_silently(home_account_id, scopes)``
     before every attempt (FR-4-AC-1) -- see the module docstring for the full contract, retry, and
     error-classification behavior.
+
+    The URL is validated against the scheme/host allowlist FIRST -- before any token is acquired,
+    let alone attached (fix-graph-hardening, audit F-01). This is the single choke point every
+    caller (including nextLink paging) funnels through, so the check lives here, not in callers.
     """
+    _validate_graph_url(url)
+
     backoff_seconds: float | None = None
     last_retry_after_seen: float | None = None
     attempt = 0
@@ -224,7 +275,16 @@ async def graph_get_json(
         status = response.status_code
 
         if status == 200:
-            return response.json()
+            try:
+                return response.json()
+            except ValueError as exc:
+                # A 200 whose body fails JSON parsing is a contract violation, not a caller
+                # crash: surface it typed (audit F-03, spec.md §9 "beta contract change").
+                raise GraphError(
+                    f"Graph returned a non-JSON 200 response from {url}",
+                    status_code=status,
+                    response_body=_summarize_body(response),
+                ) from exc
 
         if status == 404:
             raise GraphNotFound(
@@ -239,10 +299,20 @@ async def graph_get_json(
                 admin_consent_url=None,
             )
 
-        if status == 429:
+        if status == 429 or status in _RETRYABLE_SERVER_STATUSES:
             attempt += 1
             retry_after = _parse_retry_after_seconds(response.headers.get("Retry-After"))
             if retry_after is not None:
+                if retry_after > _RETRY_AFTER_CAP_SECONDS:
+                    # An honored header must not be able to park the refresh for hours
+                    # (fix-graph-hardening, audit F-17).
+                    logger.warning(
+                        "graph_get_json: %s sent Retry-After=%.0fs, clamping to the %.0fs cap",
+                        url,
+                        retry_after,
+                        _RETRY_AFTER_CAP_SECONDS,
+                    )
+                    retry_after = _RETRY_AFTER_CAP_SECONDS
                 last_retry_after_seen = retry_after
                 sleep_seconds = retry_after
             else:
@@ -251,20 +321,28 @@ async def graph_get_json(
 
             if attempt > max_retries:
                 logger.warning(
-                    "graph_get_json: %s throttled past max_retries=%d, giving up",
+                    "graph_get_json: %s failing with status %d past max_retries=%d, giving up",
                     url,
+                    status,
                     max_retries,
                 )
-                raise GraphThrottled(
-                    f"Graph throttled {url} past the retry budget",
+                if status == 429:
+                    raise GraphThrottled(
+                        f"Graph throttled {url} past the retry budget",
+                        status_code=status,
+                        response_body=_summarize_body(response),
+                        retry_after_seconds=last_retry_after_seen,
+                    )
+                raise GraphError(
+                    f"Graph request to {url} failed with status {status} past the retry budget",
                     status_code=status,
                     response_body=_summarize_body(response),
-                    retry_after_seconds=last_retry_after_seen,
                 )
 
             logger.info(
-                "graph_get_json: %s throttled (attempt %d/%d), sleeping %.1fs before retry",
+                "graph_get_json: %s transient failure (status %d, attempt %d/%d), sleeping %.1fs before retry",
                 url,
+                status,
                 attempt,
                 max_retries,
                 sleep_seconds,

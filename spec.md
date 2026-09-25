@@ -985,7 +985,8 @@ Consequences:
 | Auth | Feed token rejected (`401` at feed) despite successful issuance | Treat as identity-model failure, not expiry: `Unavailable(reason)` to the launcher, native disabled with reason, web fallback offered; log the audience actually issued |
 | Graph | `403` insufficient privileges / consent missing | Guided admin-consent flow: explain that a tenant admin must approve, show the admin-consent URL for forwarding |
 | Graph | `404` on `/me/cloudPCs` (no license/assignment) | Empty state: "No Cloud PC is assigned to this account" |
-| Graph | `429` throttled | Honor `Retry-After`; exponential backoff; no user-visible error unless persistent |
+| Graph | `429` throttled | Honor `Retry-After` (clamped to a 300 s ceiling — an oversized header must not park a refresh); exponential backoff otherwise; no user-visible error unless persistent |
+| Graph | Transient `5xx` (`502`/`503`/`504`) | Retried within the same backoff budget as `429`; `500` surfaces immediately (server bug, not transience). Amended by the fix-graph-hardening change (2026-09-25, audit F-16/F-17) |
 | Graph | Beta contract change (unexpected shape) | Disable affected action with "Microsoft API change" message; log for triage |
 | Feed | Discovery/download failure | AVD section shows inline error + retry; Cloud PC section unaffected |
 | Config | **Field validation failure** (host outside the allowlist, malformed value) | Reject the configuration; report as a **security** error, not a connection error; no session attempted; retry does not re-offer the same config (section 10.1) |
@@ -1032,7 +1033,9 @@ Required controls:
   only if Microsoft publishes a stable pin set, or if a same-CA feed-tampering incident is observed in practice.
 - **Allowlist validation of every host-shaped field** returned by the feed, against expected Microsoft domain
   suffixes, **before** it is written into a configuration. A value outside the allowlist is a security error
-  (section 9), not a connection error, and the composed file is discarded.
+  (section 9), not a connection error, and the composed file is discarded. The same principle applies to
+  remote-supplied fetch targets: Graph paging URLs (`@odata.nextLink`) are validated (scheme `https`, host exactly
+  `graph.microsoft.com`) before any bearer token is attached (fix-graph-hardening change, audit F-01).
 - **Type and shape validation of every other field** consumed from the feed; unknown fields are dropped rather than
   passed through, so the feed cannot inject configuration this client has not reasoned about.
 - **Handoff hygiene**: the composed configuration is written to a file with `0600` permissions in a user-private

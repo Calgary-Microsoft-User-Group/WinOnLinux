@@ -318,6 +318,221 @@ def test_auth_manager_errors_propagate_unmodified(monkeypatch):
         asyncio.run(scenario())
 
 
+# --- URL validation before token attachment (fix-graph-hardening, audit F-01) ---------------------
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://attacker.example/v1.0/me/cloudPCs",
+        "https://graph.microsoft.com.attacker.example/v1.0/me/cloudPCs",
+        "https://evilgraph.microsoft.com/v1.0/me/cloudPCs",
+        "http://graph.microsoft.com/v1.0/me/cloudPCs",
+        "ftp://graph.microsoft.com/v1.0/me/cloudPCs",
+    ],
+)
+def test_disallowed_url_rejected_before_any_token_or_http(monkeypatch, bad_url):
+    """A URL outside the https://graph.microsoft.com allowlist -- the shape a tampered
+    @odata.nextLink would take -- must be rejected BEFORE a token is acquired, and no HTTP
+    request may be made for it."""
+
+    def unreachable_get(*a, **k):
+        raise AssertionError("requests.get must never be reached for a disallowed URL")
+
+    monkeypatch.setattr(requests, "get", unreachable_get)
+    auth_manager = FakeAuthManager()
+
+    async def scenario():
+        await graph_get_json(
+            bad_url, auth_manager=auth_manager, home_account_id=FAKE_HOME_ACCOUNT_ID, scopes=FAKE_SCOPES
+        )
+
+    with pytest.raises(GraphError):
+        asyncio.run(scenario())
+    # No token was ever acquired for the rejected URL -- the F-01 exfiltration channel is closed
+    # at the acquisition step, not just the send step.
+    assert auth_manager.call_count == 0
+
+
+@pytest.mark.parametrize("non_string_url", [None, 123, {"@odata.nextLink": "x"}, ["https://graph.microsoft.com/"]])
+def test_non_string_url_rejected(monkeypatch, non_string_url):
+    monkeypatch.setattr(
+        requests, "get", lambda *a, **k: (_ for _ in ()).throw(AssertionError("unreachable"))
+    )
+    auth_manager = FakeAuthManager()
+
+    async def scenario():
+        await graph_get_json(
+            non_string_url,
+            auth_manager=auth_manager,
+            home_account_id=FAKE_HOME_ACCOUNT_ID,
+            scopes=FAKE_SCOPES,
+        )
+
+    with pytest.raises(GraphError):
+        asyncio.run(scenario())
+    assert auth_manager.call_count == 0
+
+
+# --- malformed 200 payloads (fix-graph-hardening, audit F-03) --------------------------------------
+
+
+def test_200_with_non_json_body_raises_graph_error(monkeypatch):
+    """A 200 whose body fails JSON parsing must surface as the typed GraphError, never as a bare
+    requests JSONDecodeError/ValueError escaping to the caller."""
+    monkeypatch.setattr(
+        requests, "get", lambda *a, **k: FakeResponse(200, text="<html>gateway mangled this</html>")
+    )
+    auth_manager = FakeAuthManager()
+
+    async def scenario():
+        await graph_get_json(
+            FAKE_URL, auth_manager=auth_manager, home_account_id=FAKE_HOME_ACCOUNT_ID, scopes=FAKE_SCOPES
+        )
+
+    with pytest.raises(GraphError) as excinfo:
+        asyncio.run(scenario())
+    assert excinfo.value.status_code == 200
+
+
+# --- transient 5xx retry and Retry-After cap (fix-graph-hardening, audit F-16/F-17) ---------------
+
+
+def test_503_then_200_retries_transparently(monkeypatch):
+    """A single transient 503 must be absorbed by the retry budget -- no user-visible failure
+    (spec.md section 9 as amended by fix-graph-hardening)."""
+    recorded_sleeps = _patch_sleep(monkeypatch)
+    expected = {"value": []}
+    call_sequence = [
+        FakeResponse(503, text="service unavailable"),
+        FakeResponse(200, json_body=expected),
+    ]
+    calls: list[int] = []
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        return call_sequence[len(calls) - 1]
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    auth_manager = FakeAuthManager()
+
+    async def scenario():
+        return await graph_get_json(
+            FAKE_URL, auth_manager=auth_manager, home_account_id=FAKE_HOME_ACCOUNT_ID, scopes=FAKE_SCOPES
+        )
+
+    result = asyncio.run(scenario())
+
+    assert result == expected
+    assert len(calls) == 2
+    assert len(recorded_sleeps) == 1
+    # Fresh token before every attempt still holds on the 5xx path (FR-4-AC-1).
+    assert auth_manager.call_count == 2
+
+
+def test_500_is_not_retried(monkeypatch):
+    """500 signals a server bug, not transience -- it must fail fast with zero retries."""
+    _patch_sleep(monkeypatch)
+    calls: list[int] = []
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        return FakeResponse(500, text="internal error")
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    auth_manager = FakeAuthManager()
+
+    async def scenario():
+        await graph_get_json(
+            FAKE_URL, auth_manager=auth_manager, home_account_id=FAKE_HOME_ACCOUNT_ID, scopes=FAKE_SCOPES
+        )
+
+    with pytest.raises(GraphError) as excinfo:
+        asyncio.run(scenario())
+    assert excinfo.value.status_code == 500
+    assert len(calls) == 1
+
+
+def test_5xx_past_retry_budget_raises_graph_error_not_throttled(monkeypatch):
+    """Persistent 502 exhausts the same budget as 429 but surfaces as plain GraphError --
+    GraphThrottled stays reserved for actual throttling."""
+    recorded_sleeps = _patch_sleep(monkeypatch)
+    monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(502, text="bad gateway"))
+    auth_manager = FakeAuthManager()
+
+    async def scenario():
+        await graph_get_json(
+            FAKE_URL,
+            auth_manager=auth_manager,
+            home_account_id=FAKE_HOME_ACCOUNT_ID,
+            scopes=FAKE_SCOPES,
+            max_retries=2,
+        )
+
+    with pytest.raises(GraphError) as excinfo:
+        asyncio.run(scenario())
+    assert not isinstance(excinfo.value, GraphThrottled)
+    assert excinfo.value.status_code == 502
+    # 1 initial attempt + 2 retries = 3 attempts, 2 sleeps between them.
+    assert auth_manager.call_count == 3
+    assert len(recorded_sleeps) == 2
+
+
+def test_retry_after_above_cap_is_clamped(monkeypatch):
+    """Retry-After: 3600 must not park the refresh for an hour -- the honored value is clamped to
+    the 300s ceiling (audit F-17)."""
+    recorded_sleeps = _patch_sleep(monkeypatch)
+    call_sequence = [
+        FakeResponse(429, headers={"Retry-After": "3600"}, text="throttled"),
+        FakeResponse(200, json_body={"value": []}),
+    ]
+    calls: list[int] = []
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        return call_sequence[len(calls) - 1]
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    auth_manager = FakeAuthManager()
+
+    async def scenario():
+        return await graph_get_json(
+            FAKE_URL, auth_manager=auth_manager, home_account_id=FAKE_HOME_ACCOUNT_ID, scopes=FAKE_SCOPES
+        )
+
+    result = asyncio.run(scenario())
+    assert result == {"value": []}
+    assert recorded_sleeps == [300.0]
+
+
+def test_retry_after_http_date_form_falls_back_to_backoff(monkeypatch):
+    """The RFC 7231 HTTP-date form is the documented ASSUMED-rare gap: it must fall back to
+    exponential backoff (1s first step), never crash (closes the F-22 date-form test gap for
+    this module)."""
+    recorded_sleeps = _patch_sleep(monkeypatch)
+    call_sequence = [
+        FakeResponse(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, text="throttled"),
+        FakeResponse(200, json_body={"value": []}),
+    ]
+    calls: list[int] = []
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        return call_sequence[len(calls) - 1]
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    auth_manager = FakeAuthManager()
+
+    async def scenario():
+        return await graph_get_json(
+            FAKE_URL, auth_manager=auth_manager, home_account_id=FAKE_HOME_ACCOUNT_ID, scopes=FAKE_SCOPES
+        )
+
+    result = asyncio.run(scenario())
+    assert result == {"value": []}
+    assert recorded_sleeps == [1.0]
+
+
 # --- log redaction discipline (spec.md section 10.7) ------------------------------------------------
 
 
