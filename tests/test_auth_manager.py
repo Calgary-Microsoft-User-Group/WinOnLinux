@@ -41,15 +41,19 @@ FAKE_CLAIMS = '{"access_token":{"acrs":{"essential":true,"values":["c1"]}}}'
 
 
 class FakeTaskRegistry:
-    """Minimal stand-in for winonlinux.task_registry.TaskRegistry -- AuthManager only ever calls
-    cancel_group() on it (switch_active_account), matching the real class's confirmed signature
-    `cancel_group(self, account_id: AccountId | None) -> None`."""
+    """Minimal stand-in for winonlinux.task_registry.TaskRegistry -- AuthManager calls
+    cancel_group() (switch_active_account) and destroy_group() (sign_out, fix-account-lifecycle)
+    on it, matching the real class's confirmed signatures."""
 
     def __init__(self) -> None:
         self.cancel_group_calls: list[object] = []
+        self.destroy_group_calls: list[object] = []
 
     def cancel_group(self, account_id: object) -> None:
         self.cancel_group_calls.append(account_id)
+
+    def destroy_group(self, account_id: object) -> None:
+        self.destroy_group_calls.append(account_id)
 
 
 class FakeMsalApp:
@@ -731,3 +735,175 @@ def test_acquire_token_silently_never_logs_token_or_claims_values(caplog):
     claims_leaked = FAKE_CLAIMS in caplog.text
     assert not token_leaked, "an access token value leaked into the log output"
     assert not claims_leaked, "a claims value leaked into the log output"
+
+
+# --- fix-account-lifecycle (audit F-04/F-05/F-13/F-19) --------------------------------------------
+
+
+def test_sign_out_destroys_the_accounts_task_group():
+    """sign_out must tear down the account's background work (FR-3-AC-3, audit F-05's
+    orphaned-poll-loop fix) -- destroy_group called exactly once, for that account, after the
+    cache removal."""
+
+    async def scenario():
+        app = FakeMsalApp()
+        app.accounts["acct-signout-group"] = {
+            "home_account_id": "acct-signout-group", "username": "user@contoso.com"
+        }
+        manager, task_registry = _make_manager(app)
+        _seeded_account(manager, "acct-signout-group")
+
+        await manager.sign_out("acct-signout-group")
+
+        assert task_registry.destroy_group_calls == ["acct-signout-group"]
+        assert "acct-signout-group" not in manager.accounts
+
+    asyncio.run(scenario())
+
+
+def test_sign_out_scheduled_inside_the_accounts_own_group_still_completes():
+    """A sign_out running INSIDE the account's own task group cancels itself via destroy_group --
+    the method must still complete its removal work (the self-cancellation is only deliverable at
+    a later await), not deadlock or leave state half-removed."""
+    from winonlinux.task_registry import TaskRegistry
+
+    async def scenario():
+        app = FakeMsalApp()
+        app.accounts["acct-inside"] = {
+            "home_account_id": "acct-inside", "username": "user@contoso.com"
+        }
+        registry = TaskRegistry()
+        manager = AuthManager(task_registry=registry, client_id="test-client-id")
+        manager._app = app
+        _seeded_account(manager, "acct-inside")
+
+        completed = {"flag": False}
+
+        async def sign_out_from_inside():
+            await manager.sign_out("acct-inside")
+            completed["flag"] = True
+
+        task = registry.get_or_create_group("acct-inside").create_task(sign_out_from_inside())
+        # The task either completes normally (cancellation never delivered -- no await after
+        # sign_out returns) or is marked cancelled at its end; the removal must have happened
+        # either way and nothing may deadlock.
+        try:
+            await asyncio.wait_for(task, timeout=5)
+        except asyncio.CancelledError:
+            pass
+
+        assert completed["flag"] is True
+        assert "acct-inside" not in manager.accounts
+
+    asyncio.run(scenario())
+
+
+def test_acquire_token_silently_unknown_account_raises_typed_error():
+    """A removed/unknown account raises AccountUnknownError (an AuthError), never a bare
+    KeyError -- the audit F-05 poll-loop failure shape."""
+    from winonlinux.auth_manager import AccountUnknownError
+
+    async def scenario():
+        manager, _ = _make_manager()
+        with pytest.raises(AccountUnknownError):
+            await manager.acquire_token_silently("acct-never-signed-in", ["CloudPC.Read.All"])
+
+    asyncio.run(scenario())
+
+
+def test_reauth_from_banner_unknown_account_raises_typed_error():
+    from winonlinux.auth_manager import AccountUnknownError
+
+    async def scenario():
+        manager, _ = _make_manager()
+        with pytest.raises(AccountUnknownError):
+            await manager.reauth_from_banner("acct-never-signed-in")
+
+    asyncio.run(scenario())
+
+
+def test_unstarted_manager_refuses_typed_with_no_socket_opened(monkeypatch):
+    """Before start() completes (incl. after a KeyringUnavailable refusal, D-2), every public
+    operation raises AuthManagerNotStarted BEFORE any side effect -- in particular no loopback
+    listener is ever constructed (audit F-13)."""
+    from winonlinux.auth_manager import AuthManagerNotStarted
+
+    constructed: list[object] = []
+
+    class RecordingListener:
+        def __init__(self, **kwargs):
+            constructed.append(self)
+
+    monkeypatch.setattr(auth_manager, "LoopbackListener", RecordingListener)
+
+    async def scenario():
+        manager = AuthManager(task_registry=FakeTaskRegistry(), client_id="test-client-id")
+        # start() never called: _app is None, exactly the post-KeyringUnavailable shape.
+        with pytest.raises(AuthManagerNotStarted):
+            await manager.add_account()
+        with pytest.raises(AuthManagerNotStarted):
+            await manager.reauth_from_banner("any-account")
+        with pytest.raises(AuthManagerNotStarted):
+            await manager.acquire_token_silently("any-account", ["CloudPC.Read.All"])
+        with pytest.raises(AuthManagerNotStarted):
+            await manager.sign_out("any-account")
+        with pytest.raises(AuthManagerNotStarted):
+            await manager.switch_active_account("any-account")
+
+    asyncio.run(scenario())
+    assert constructed == []
+
+
+def test_silent_acquisition_passes_through_silent_refresh_and_returns_to_active():
+    """The section 6.4 SilentRefresh state is real and observable during the MSAL call
+    (audit F-19), and a success lands back in ACTIVE."""
+
+    async def scenario():
+        app = FakeMsalApp()
+        home_account_id = "acct-silent-refresh"
+        app.accounts[home_account_id] = {
+            "home_account_id": home_account_id, "username": "user@contoso.com"
+        }
+        manager, _ = _make_manager(app)
+        account_state = _seeded_account(manager, home_account_id)
+
+        observed_states: list[AuthState] = []
+
+        def result_factory(scopes, account):
+            observed_states.append(account_state.state)
+            return {"access_token": FAKE_ACCESS_TOKEN}
+
+        app.silent_result_factory = result_factory
+
+        token = await manager.acquire_token_silently(home_account_id, ["CloudPC.Read.All"])
+
+        assert token == FAKE_ACCESS_TOKEN
+        assert observed_states == [AuthState.SILENT_REFRESH]
+        assert account_state.state is AuthState.ACTIVE
+
+    asyncio.run(scenario())
+
+
+def test_offline_account_recovers_through_silent_refresh():
+    """OFFLINE -> SILENT_REFRESH -> ACTIVE: the recovery path a later successful poll tick
+    drives (section 6.4; audit F-19)."""
+
+    async def scenario():
+        app = FakeMsalApp()
+        home_account_id = "acct-offline-recovery"
+        app.accounts[home_account_id] = {
+            "home_account_id": home_account_id, "username": "user@contoso.com"
+        }
+        manager, _ = _make_manager(app)
+        account_state = _seeded_account(manager, home_account_id)
+        account_state.mark_offline()
+        assert account_state.state is AuthState.OFFLINE
+
+        app.silent_result_factory = lambda scopes, account: {"access_token": FAKE_ACCESS_TOKEN}
+
+        token = await manager.acquire_token_silently(home_account_id, ["CloudPC.Read.All"])
+
+        assert token == FAKE_ACCESS_TOKEN
+        assert account_state.state is AuthState.ACTIVE
+
+    asyncio.run(scenario())

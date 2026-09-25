@@ -303,3 +303,51 @@ def test_sign_out_clears_everything():
     assert account.pending_admin_consent_url is None
     assert account.retry_count == 0
     assert account.login_hint is None
+
+
+# -- fix-account-lifecycle (audit F-14/F-19): guards on every mutator, OFFLINE recovery --------
+
+
+def _blocked_account() -> AccountAuthState:
+    account = AccountAuthState("acct-blocked", login_hint="user@contoso.com")
+    account.mark_active()
+    account.apply_error(_classified(MsalErrorCategory.DEVICE_CA_BLOCKED))
+    assert account.state is AuthState.DEVICE_CA_BLOCKED
+    return account
+
+
+def test_mark_active_noops_on_a_device_ca_blocked_account():
+    account = _blocked_account()
+    account.mark_active(login_hint="user@contoso.com")
+    assert account.state is AuthState.DEVICE_CA_BLOCKED
+
+
+def test_mark_offline_noops_on_a_device_ca_blocked_account():
+    account = _blocked_account()
+    account.mark_offline()
+    assert account.state is AuthState.DEVICE_CA_BLOCKED
+
+
+def test_begin_silent_refresh_noops_on_a_device_ca_blocked_account():
+    account = _blocked_account()
+    account.begin_silent_refresh()
+    assert account.state is AuthState.DEVICE_CA_BLOCKED
+
+
+def test_sign_out_still_moves_away_from_device_ca_blocked():
+    """sign_out() must remain the ONE legal exit from the terminal state (spec.md section 6.5)."""
+    account = _blocked_account()
+    account.sign_out()
+    assert account.state is AuthState.SIGNED_OUT
+
+
+def test_begin_silent_refresh_is_legal_from_offline():
+    """OFFLINE -> SILENT_REFRESH is the section 6.4 recovery path (audit F-19)."""
+    account = AccountAuthState("acct-offline")
+    account.mark_active()
+    account.mark_offline()
+    account.begin_silent_refresh()
+    assert account.state is AuthState.SILENT_REFRESH
+    # ...and a successful outcome lands back in ACTIVE.
+    account.mark_active()
+    assert account.state is AuthState.ACTIVE

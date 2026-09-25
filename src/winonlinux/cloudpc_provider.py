@@ -50,6 +50,7 @@ from abc import ABC
 from dataclasses import dataclass
 
 from winonlinux import graph_client
+from winonlinux.auth_manager import AccountUnknownError
 from winonlinux.task_registry import TaskRegistry
 
 __all__ = [
@@ -205,15 +206,22 @@ class CloudPcProvider:
         self._scopes: tuple[str, ...] = tuple(scopes)
         self._poll_interval_seconds = poll_interval_seconds
 
-        #: ``None`` only before the very first refresh ever completes (successfully or not --
-        #: see refresh_now's docstring: a Failed result never overwrites this).
-        self.last_result: EnumerationResult | None = None
+        # Keyed by home_account_id (FR-3 isolation; fix-account-lifecycle, audit F-04): one
+        # account's entries must never appear as another account's "previous results" after a
+        # switch. A Failed result never overwrites an account's entry -- see refresh_now.
+        self._last_results: dict[str, EnumerationResult] = {}
 
         # The single currently-running poll task (if any) and which account it is polling for.
         # Cancelling this task directly (never via task_registry.cancel_group, which would cancel
         # ALL of that account's in-flight work) is what pause_polling/stop_polling do.
         self._poll_task: "asyncio.Task[None] | None" = None
         self._poll_account_id: str | None = None
+
+    def last_result_for(self, home_account_id: str) -> EnumerationResult | None:
+        """The last non-``Failed`` result recorded for ``home_account_id``, or ``None`` before
+        that account's first refresh completes. Strictly per-account (FR-3): a reader never
+        receives another account's data (fix-account-lifecycle, audit F-04)."""
+        return self._last_results.get(home_account_id)
 
     # -- core paged fetch (tasks.md 2.1-2.3) -----------------------------------------------------
 
@@ -236,9 +244,11 @@ class CloudPcProvider:
           :class:`Failed` likewise, never an untyped ``KeyError``/``TypeError`` escaping to the
           caller (spec.md §9 "beta contract change"; fix-graph-hardening, audit F-03).
 
-        :attr:`last_result` is updated to the new result on every non-``Failed`` outcome, and left
-        untouched on ``Failed`` -- so a subsequent failure's ``previous_entries`` is always derived
-        from the last genuinely successful enumeration, not from an intervening failure.
+        The per-account entry read back via :meth:`last_result_for` is updated on every
+        non-``Failed`` outcome, and left untouched on ``Failed`` -- so a subsequent failure's
+        ``previous_entries`` is always derived from the SAME account's last genuinely successful
+        enumeration, never an intervening failure and never another account's data (FR-3;
+        fix-account-lifecycle, audit F-04).
 
         An :class:`~winonlinux.auth_manager.AuthError` subclass raised by silent token acquisition
         (inside ``graph_get_json``) propagates out of this method completely uncaught -- that is a
@@ -266,17 +276,17 @@ class CloudPcProvider:
         except graph_client.GraphNotFound:
             logger.info("cloudpc_provider: account %s has no Cloud PC licence (404)", home_account_id)
             result: EnumerationResult = NoLicence()
-            self.last_result = result
+            self._last_results[home_account_id] = result
             return result
         except graph_client.GraphConsentRequired as exc:
             logger.warning(
                 "cloudpc_provider: account %s requires tenant admin consent (403)", home_account_id
             )
             result = ConsentRequired(admin_consent_url=exc.admin_consent_url)
-            self.last_result = result
+            self._last_results[home_account_id] = result
             return result
         except graph_client.GraphError as exc:
-            previous = self.last_result.entries if isinstance(self.last_result, Enumerated) else []
+            previous = self._previous_entries(home_account_id)
             logger.warning(
                 "cloudpc_provider: refresh for account %s failed (%s); keeping %d previous entr%s",
                 home_account_id,
@@ -290,7 +300,7 @@ class CloudPcProvider:
             # `id`, non-list `value`, ...) must stay inside the typed result taxonomy -- spec.md §9
             # "beta contract change" row (fix-graph-hardening, audit F-03). One malformed entry
             # fails the whole refresh (never a partial Enumerated), previous entries retained.
-            previous = self.last_result.entries if isinstance(self.last_result, Enumerated) else []
+            previous = self._previous_entries(home_account_id)
             logger.warning(
                 "cloudpc_provider: refresh for account %s hit an unexpected /me/cloudPCs shape "
                 "(%s: %s) -- possible Graph contract change; keeping %d previous entr%s",
@@ -306,8 +316,12 @@ class CloudPcProvider:
             result = Empty()
         else:
             result = Enumerated(entries=entries)
-        self.last_result = result
+        self._last_results[home_account_id] = result
         return result
+
+    def _previous_entries(self, home_account_id: str) -> list[CloudPcEntry]:
+        prior = self._last_results.get(home_account_id)
+        return prior.entries if isinstance(prior, Enumerated) else []
 
     # -- refresh lifecycle (§7.3, tasks.md 3.1-3.3) ----------------------------------------------
 
@@ -413,6 +427,16 @@ class CloudPcProvider:
             await asyncio.sleep(self._poll_interval_seconds)
             try:
                 await self.refresh_now(home_account_id)
+            except AccountUnknownError:
+                # The account was signed out from under this loop. Terminal, not retryable:
+                # ending the task here is the backstop for any path that starts polling without
+                # a matching teardown (fix-account-lifecycle, audit F-05) -- the primary teardown
+                # is AuthManager.sign_out destroying the account's task group.
+                logger.info(
+                    "cloudpc_provider: account %s is no longer signed in; ending its poll loop",
+                    home_account_id,
+                )
+                return
             except Exception:  # noqa: BLE001 - deliberately broad, see docstring
                 logger.warning(
                     "cloudpc_provider: periodic refresh for account %s failed; previous result "

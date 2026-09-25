@@ -1302,6 +1302,12 @@ Verification codes: **U** unit/fixture · **I** integration against a live tenan
     client ID and feed scope values; and the `getCloudPcLaunchInfo` hard stop of 2026-10-30. **Re-verify all of them
     as the first task of Stage 0**, since the plan's shape depends on them. A volatile-facts register with owners and
     review dates is outstanding work.
+15. **MSAL cached-token semantics are assumed, not verified.** The §6.4 Offline path ("keep using an unexpired
+    cached AT") is delegated entirely to MSAL Python: the code assumes `acquire_token_silent*` serves a cached,
+    unexpired access token with zero network and applies its own expiry/clock-skew buffer. Recorded here
+    (fix-account-lifecycle change, 2026-09-25, audit F-18/A-10) so it is verified alongside V1's `msal-extensions`
+    check rather than trusted silently — if MSAL ever attempts proactive refresh and raises on network failure, a
+    valid cached AT could exist while the client reports Offline.
 
 ---
 

@@ -94,7 +94,7 @@ def test_paging_follows_next_link_and_surfaces_every_entry_from_both_pages(monke
         assert entry.provisioning_type == raw["provisioningType"]
         assert entry.image_display_name == raw["imageDisplayName"]
 
-    assert provider.last_result is result
+    assert provider.last_result_for(FAKE_ACCOUNT) is result
 
 
 def test_failure_on_page_two_of_three_never_surfaces_a_partial_enumerated(monkeypatch):
@@ -125,7 +125,7 @@ def test_failure_on_page_two_of_three_never_surfaces_a_partial_enumerated(monkey
     # No prior successful enumeration existed, so previous_entries is empty -- specifically NOT
     # page 1's single entry, which must never leak through as a "successful" partial result.
     assert result.previous_entries == []
-    assert provider.last_result is None
+    assert provider.last_result_for(FAKE_ACCOUNT) is None
 
 
 # --- 5.3 state distinction: Empty / NoLicence / Failed-keeps-previous / ConsentRequired ---------
@@ -141,7 +141,7 @@ def test_empty_collection_after_exhausted_paging_returns_empty_not_error(monkeyp
     result = asyncio.run(provider.refresh_now(FAKE_ACCOUNT))
 
     assert isinstance(result, Empty)
-    assert provider.last_result is result
+    assert provider.last_result_for(FAKE_ACCOUNT) is result
 
 
 def test_404_returns_no_licence_distinct_from_empty(monkeypatch):
@@ -157,7 +157,7 @@ def test_404_returns_no_licence_distinct_from_empty(monkeypatch):
 
     assert isinstance(result, NoLicence)
     assert not isinstance(result, Empty)
-    assert provider.last_result is result
+    assert provider.last_result_for(FAKE_ACCOUNT) is result
 
 
 def test_403_returns_consent_required_carrying_admin_consent_url(monkeypatch):
@@ -176,7 +176,7 @@ def test_403_returns_consent_required_carrying_admin_consent_url(monkeypatch):
     assert isinstance(result, ConsentRequired)
     # graph_client documents admin_consent_url as None in the common case -- mapped through as-is.
     assert result.admin_consent_url is None
-    assert provider.last_result is result
+    assert provider.last_result_for(FAKE_ACCOUNT) is result
 
 
 def test_failed_refresh_keeps_previous_enumerated_entries(monkeypatch):
@@ -203,7 +203,7 @@ def test_failed_refresh_keeps_previous_enumerated_entries(monkeypatch):
     assert second.previous_entries != []
     # A Failed result must not overwrite last_result -- the next failure's previous_entries must
     # still be derivable from the last genuinely successful enumeration.
-    assert provider.last_result is first
+    assert provider.last_result_for(FAKE_ACCOUNT) is first
 
 
 def test_four_result_types_are_distinct_via_isinstance(monkeypatch):
@@ -283,7 +283,7 @@ def test_auth_error_from_silent_acquisition_propagates_out_of_refresh_now(monkey
         asyncio.run(provider.refresh_now(FAKE_ACCOUNT))
 
     # No typed result was produced -- last_result stays at its initial None.
-    assert provider.last_result is None
+    assert provider.last_result_for(FAKE_ACCOUNT) is None
 
 
 # --- 5.5 cancellation: account switch cancels in-flight enumeration (FR-3-AC-2) -----------------
@@ -449,7 +449,7 @@ def test_refresh_after_action_delegates_to_refresh_now(monkeypatch):
     result = asyncio.run(provider.refresh_after_action(FAKE_ACCOUNT))
 
     assert isinstance(result, Empty)
-    assert provider.last_result is result
+    assert provider.last_result_for(FAKE_ACCOUNT) is result
 
 
 # --- malformed 200 payloads stay inside the typed taxonomy (fix-graph-hardening, audit F-03) -----
@@ -477,7 +477,7 @@ def test_entry_missing_id_yields_failed_not_keyerror(monkeypatch):
     assert isinstance(second, Failed)
     assert isinstance(second.error, KeyError)
     assert second.previous_entries == first.entries
-    assert provider.last_result is first
+    assert provider.last_result_for(FAKE_ACCOUNT) is first
 
 
 def test_non_list_value_yields_failed(monkeypatch):
@@ -495,3 +495,59 @@ def test_non_list_value_yields_failed(monkeypatch):
     assert isinstance(result, Failed)
     assert isinstance(result.error, TypeError)
     assert result.previous_entries == []
+
+
+# --- per-account enumeration state (fix-account-lifecycle, audit F-04) ---------------------------
+
+
+def test_failed_refresh_for_a_different_account_carries_no_other_accounts_entries(monkeypatch):
+    """Account A enumerates; account B's first refresh fails -> B's Failed carries NO previous
+    entries (A's data must never bleed into B's result, FR-3), and A's own last result survives
+    untouched for a switch back."""
+    page = _load_fixture("cloudpcs_page2.json")  # single page, no @odata.nextLink
+
+    async def fake_graph_get_json(url, *, home_account_id, **kwargs):
+        if home_account_id == "account-a":
+            return page
+        raise graph_client.GraphNetworkError("network unreachable")
+
+    monkeypatch.setattr(cloudpc_provider.graph_client, "graph_get_json", fake_graph_get_json)
+    provider = _make_provider()
+
+    first = asyncio.run(provider.refresh_now("account-a"))
+    assert isinstance(first, Enumerated)
+
+    b_result = asyncio.run(provider.refresh_now("account-b"))
+
+    assert isinstance(b_result, Failed)
+    assert b_result.previous_entries == []
+    # Switching back: A's list is still A's (FR-1-AC-4, preserved per account).
+    assert provider.last_result_for("account-a") is first
+    assert provider.last_result_for("account-b") is None
+
+
+# --- poll loop ends for a signed-out account (fix-account-lifecycle, audit F-05) -----------------
+
+
+def test_poll_loop_ends_terminally_on_account_unknown_error(monkeypatch):
+    """AccountUnknownError from a poll tick means the account was signed out from under the
+    loop -- the task must END (backstop teardown), not log-and-retry every interval forever."""
+    from winonlinux.auth_manager import AccountUnknownError
+
+    async def fake_graph_get_json(url, **kwargs):
+        raise AccountUnknownError("account-gone")
+
+    monkeypatch.setattr(cloudpc_provider.graph_client, "graph_get_json", fake_graph_get_json)
+
+    async def scenario():
+        provider = _make_provider(poll_interval_seconds=0.01)
+        # AuthError subclasses propagate out of refresh_now uncaught by design -- so raising from
+        # the graph layer surfaces AccountUnknownError to the poll loop exactly as a real
+        # signed-out account's silent acquisition would.
+        provider.start_polling("account-gone")
+        task = provider._poll_task
+        await asyncio.wait_for(task, timeout=5)
+        # Returned normally (terminal), not cancelled and not still looping.
+        assert task.done() and not task.cancelled()
+
+    asyncio.run(scenario())

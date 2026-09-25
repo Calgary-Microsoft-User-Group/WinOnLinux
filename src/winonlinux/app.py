@@ -324,11 +324,12 @@ class WinOnLinuxApplication(Adw.Application):
         so it is cancelled automatically if the active account changes again before it finishes.
 
         The :meth:`CloudPcProvider.refresh_now` call is awaited (not fire-and-forgotten) so
-        ``self.cloudpc_provider.last_result`` is populated by the time this task completes -- but
+        ``self.cloudpc_provider.last_result_for(home_account_id)`` is populated by the time this
+        task completes -- but
         any exception it raises (including an ``AuthError`` subclass propagating straight out of
         ``refresh_now``, e.g. ``ReauthRequiredError`` for a cached account whose refresh token has
         since been revoked) is caught and logged here rather than left to asyncio's generic
-        "exception was never retrieved" task-exception warning: ``last_result`` already carries a
+        "exception was never retrieved" task-exception warning: ``last_result_for`` already carries a
         typed outcome for a future UI to read (or stays whatever it was before, if this call
         raised before producing a new one), and there is no caller here that could usefully react
         to the exception itself.
@@ -338,7 +339,7 @@ class WinOnLinuxApplication(Adw.Application):
             await self.cloudpc_provider.refresh_now(home_account_id)
         except Exception as exc:  # noqa: BLE001 - deliberately broad, see docstring
             logger.warning(
-                "CloudPC enumeration for account %s failed (%s); cloudpc_provider.last_result "
+                "CloudPC enumeration for account %s failed (%s); the provider's per-account result "
                 "reflects whatever outcome was produced, if any",
                 home_account_id,
                 type(exc).__name__,

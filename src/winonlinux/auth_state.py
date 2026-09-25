@@ -173,7 +173,14 @@ class AccountAuthState:
 
         Clears any pending claims challenge or admin-consent URL, resets the claims-challenge
         retry counter, and updates ``login_hint`` when one is given.
+
+        No-ops (with a log line) on a DEVICE_CA_BLOCKED account -- §6.5 makes that state terminal
+        against EVERY mutator, not just apply_error()/begin_interactive(); a future caller (e.g.
+        an action change catching its own errors) must not be able to silently resurrect a
+        blocked account (fix-account-lifecycle, audit F-14).
         """
+        if self._blocked_guard("mark_active"):
+            return
         self._log_transition("mark_active", AuthState.ACTIVE)
         self._state = AuthState.ACTIVE
         self._pending_claims = None
@@ -183,18 +190,26 @@ class AccountAuthState:
             self._login_hint = login_hint
 
     def begin_silent_refresh(self) -> None:
-        """ACTIVE -> SILENT_REFRESH. A marker only -- callers still call apply_error()/mark_active()
-        with the outcome once the silent acquisition completes."""
+        """ACTIVE/OFFLINE -> SILENT_REFRESH. A marker only -- callers still call
+        apply_error()/mark_active()/mark_offline() with the outcome once the silent acquisition
+        completes. OFFLINE is a legal source state: an offline account's next silent attempt is
+        exactly the §6.4 recovery path (fix-account-lifecycle, audit F-19). No-ops on a
+        DEVICE_CA_BLOCKED account (§6.5, audit F-14)."""
+        if self._blocked_guard("begin_silent_refresh"):
+            return
         self._log_transition("begin_silent_refresh", AuthState.SILENT_REFRESH)
         self._state = AuthState.SILENT_REFRESH
 
     def apply_error(self, classified: ClassifiedMsalError) -> AuthState:
         """Drive the §6.4 transition table from a classified MSAL error.
 
-        Only called while the account is ACTIVE, SILENT_REFRESH, or INTERACTIVE_AUTH -- callers do
-        not call this from SIGNED_OUT. DEVICE_CA_BLOCKED is additionally enforced here as terminal
-        regardless of caller discipline: once an account is DEVICE_CA_BLOCKED, no category moves it
-        anywhere except an explicit :meth:`sign_out`.
+        Legal source states: ACTIVE, SILENT_REFRESH, INTERACTIVE_AUTH, and OFFLINE -- callers do
+        not call this from SIGNED_OUT. OFFLINE is named explicitly (fix-account-lifecycle, audit
+        F-19) because it is a real caller's state: an offline account's next silent attempt
+        classifies its outcome from OFFLINE (or from SILENT_REFRESH once begin_silent_refresh()
+        has run). DEVICE_CA_BLOCKED is additionally enforced here as terminal regardless of
+        caller discipline: once an account is DEVICE_CA_BLOCKED, no category moves it anywhere
+        except an explicit :meth:`sign_out`.
         """
         if self._state is AuthState.DEVICE_CA_BLOCKED:
             return AuthState.DEVICE_CA_BLOCKED
@@ -207,7 +222,10 @@ class AccountAuthState:
 
     def mark_offline(self) -> None:
         """Explicit network-exception path -> OFFLINE, for callers that catch a network exception
-        directly rather than routing it through :meth:`apply_error`."""
+        directly rather than routing it through :meth:`apply_error`. No-ops on a
+        DEVICE_CA_BLOCKED account (§6.5, audit F-14)."""
+        if self._blocked_guard("mark_offline"):
+            return
         self._log_transition("mark_offline", AuthState.OFFLINE)
         self._state = AuthState.OFFLINE
 
@@ -221,6 +239,23 @@ class AccountAuthState:
         self._login_hint = None
 
     # -- internal -------------------------------------------------------------
+
+    def _blocked_guard(self, trigger: str) -> bool:
+        """True (and logs) when the account is DEVICE_CA_BLOCKED and ``trigger`` must no-op.
+
+        No-op-with-log rather than raise: these mutators are called from error/outcome paths,
+        where a raise would turn a future caller's bug into a crash; only the deliberate user
+        action (:meth:`begin_interactive`) keeps its hard RuntimeError refusal.
+        """
+        if self._state is not AuthState.DEVICE_CA_BLOCKED:
+            return False
+        logger.warning(
+            "account %s: ignoring %s() -- DEVICE_CA_BLOCKED is terminal for this session; "
+            "only sign_out() moves away from it (spec.md §6.5)",
+            self._home_account_id,
+            trigger,
+        )
+        return True
 
     def _log_transition(self, trigger: str, new_state: AuthState) -> None:
         # Account identifiers and state transitions are logged freely; token/claims *values* never

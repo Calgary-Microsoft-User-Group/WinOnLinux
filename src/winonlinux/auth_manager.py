@@ -71,6 +71,8 @@ from winonlinux.task_registry import TaskRegistry, run_blocking
 
 __all__ = [
     "AuthError",
+    "AuthManagerNotStarted",
+    "AccountUnknownError",
     "ReauthRequiredError",
     "OfflineNoCachedTokenError",
     "DeviceCaBlockedError",
@@ -132,6 +134,32 @@ def _warn_placeholder_client_id_once() -> None:
 
 class AuthError(Exception):
     """Base class for every authentication error AuthManager raises."""
+
+
+class AuthManagerNotStarted(AuthError):
+    """A public operation was invoked before :meth:`AuthManager.start` completed -- including
+    after a :class:`~winonlinux.auth_cache.KeyringUnavailable` startup failure (D-2's refusal
+    state). Raised BEFORE any side effect (no loopback socket is opened, no MSAL call is made),
+    so the refusal is enforced at the API boundary rather than surfacing as a raw
+    ``AttributeError`` from an unset ``_app`` (fix-account-lifecycle, audit F-13)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "AuthManager.start() has not completed; sign-in and token operations are "
+            "unavailable (the keyring may be unavailable -- D-2 has no fallback)"
+        )
+
+
+class AccountUnknownError(AuthError):
+    """The requested ``home_account_id`` is not (or is no longer) in :attr:`AuthManager.accounts`
+    -- typically a caller holding a stale id after :meth:`AuthManager.sign_out` removed the
+    account. Typed so lifecycle-shaped failures never surface as a bare ``KeyError``
+    (fix-account-lifecycle, audit F-05/F-13); a poll loop receiving this treats it as terminal
+    for the signed-out account rather than retrying forever."""
+
+    def __init__(self, home_account_id: str) -> None:
+        super().__init__(f"account {home_account_id} is not signed in (unknown or removed)")
+        self.home_account_id = home_account_id
 
 
 class ReauthRequiredError(AuthError):
@@ -333,6 +361,26 @@ class AuthManager:
         if self.active_account_id is not None:
             self._notify_active_account_changed(self.active_account_id)
 
+    # -- lifecycle guards (fix-account-lifecycle, audit F-05/F-13) -------------------------------
+
+    def _require_started(self) -> None:
+        """Raise :class:`AuthManagerNotStarted` unless :meth:`start` completed.
+
+        Called FIRST in every public operation, before any side effect -- in particular before
+        :meth:`_run_interactive_auth_code_flow` opens its loopback listener socket, so a manager
+        in the D-2 keyring-refusal state never binds a socket for a sign-in that cannot proceed.
+        """
+        if self._app is None:
+            raise AuthManagerNotStarted()
+
+    def _account_state_or_raise(self, home_account_id: str) -> AccountAuthState:
+        """Typed lookup: :class:`AccountUnknownError` instead of a bare ``KeyError`` for an
+        unknown/removed account (audit F-05 -- the orphaned-poll-loop failure shape)."""
+        try:
+            return self.accounts[home_account_id]
+        except KeyError:
+            raise AccountUnknownError(home_account_id) from None
+
     # -- add / switch / sign out ------------------------------------------------------------------
 
     async def add_account(self) -> str:
@@ -340,11 +388,13 @@ class AuthManager:
         existing entry in :attr:`accounts` or change :attr:`active_account_id` unless this is the
         very first account ever added.
 
-        Raises :class:`SignInCancelled` if the user cancels, and the category-appropriate
+        Raises :class:`AuthManagerNotStarted` (before any socket is opened) if :meth:`start` has
+        not completed, :class:`SignInCancelled` if the user cancels, and the category-appropriate
         :class:`AuthError` subclass (:class:`ConsentRequiredError`, :class:`DeviceCaBlockedError`,
         :class:`ClaimsChallengeError`, or :class:`InteractiveSignInFailedError`) if the code
         exchange itself fails.
         """
+        self._require_started()
         result, redirect_uri = await self._run_interactive_auth_code_flow()
 
         if "error" in result:
@@ -385,6 +435,7 @@ class AuthManager:
         account's cached tokens or :class:`AccountAuthState` -- purely about which account
         outbound calls are scoped to and cancelling the previous one's in-flight work.
         """
+        self._require_started()
         if home_account_id == self.active_account_id:
             return
 
@@ -403,8 +454,18 @@ class AuthManager:
         self._notify_active_account_changed(home_account_id)
 
     async def sign_out(self, home_account_id: str) -> None:
-        """Remove ``home_account_id``'s cache entries and local state (FR-3-AC-3). Every other
-        account's tokens and :class:`AccountAuthState` are untouched."""
+        """Remove ``home_account_id``'s cache entries and local state (FR-3-AC-3), then destroy
+        its task group so no background work (e.g. the CloudPC poll loop) keeps running -- or
+        keeps holding data -- for a signed-out account (fix-account-lifecycle, audit F-05; D-18).
+        Every other account's tokens and :class:`AccountAuthState` are untouched.
+
+        The group is destroyed LAST, after every await in this method: a caller running inside
+        the account's own task group would otherwise cancel itself mid-removal. (Called from
+        inside the group, this method still completes -- the self-cancellation is only delivered
+        at the caller's next await, which is after this method returns -- but an app-layer
+        sign-out entry point should schedule it from outside the group, the same way
+        ``switch_active_account``'s cancel is driven.)"""
+        self._require_started()
         msal_account = await self._find_msal_account(home_account_id)
         if msal_account is not None:
             async with cache_write_serializer:
@@ -430,6 +491,11 @@ class AuthManager:
         if self.active_account_id == home_account_id:
             self.active_account_id = next(iter(self.accounts), None)
 
+        # Cancel and drop everything the signed-out account still had in flight -- the poll loop
+        # included (FR-3-AC-3; audit F-05's orphaned-poll-loop fix). Deliberately after all the
+        # awaits above, see docstring.
+        self.task_registry.destroy_group(home_account_id)
+
         logger.info("sign_out: removed account %s", home_account_id)
 
     # -- silent acquisition: the single entry point ------------------------------------------------
@@ -451,6 +517,7 @@ class AuthManager:
         only deduplicates genuinely CONCURRENT calls into that same underlying MSAL call, it does
         not reimplement MSAL's own caching.
         """
+        self._require_started()
         dedup_key = (home_account_id, tuple(sorted(scopes)))
 
         # Fast path: a concurrent call for this same (account, scopes) is already in flight --
@@ -493,7 +560,7 @@ class AuthManager:
     async def _acquire_token_silently_uncached(self, home_account_id: str, scopes: list[str]) -> str:
         """The actual, non-deduplicated silent acquisition. Only ever called from inside
         :meth:`acquire_token_silently`'s per-account lock -- see that method's docstring."""
-        account_state = self.accounts[home_account_id]
+        account_state = self._account_state_or_raise(home_account_id)
 
         # DEVICE_CA_BLOCKED is terminal for this account this session and "never retried"
         # (spec.md section 6.5) -- short-circuit before making any MSAL/network call at all,
@@ -502,6 +569,14 @@ class AuthManager:
         # are exactly the kind of noise that shows up in the tenant's own CA telemetry.
         if account_state.state is AuthState.DEVICE_CA_BLOCKED:
             raise DeviceCaBlockedError(home_account_id)
+
+        # Make the §6.4 SilentRefresh state real (fix-account-lifecycle, audit F-19): a silent
+        # acquisition for an ACTIVE or OFFLINE account is observable as SILENT_REFRESH for its
+        # duration; mark_active()/apply_error()/mark_offline() below record the outcome. Other
+        # source states (REAUTH_REQUIRED, INTERACTIVE_AUTH) are left as-is -- a refresh attempted
+        # from those is already exceptional and its state should stay honest about that.
+        if account_state.state in (AuthState.ACTIVE, AuthState.OFFLINE):
+            account_state.begin_silent_refresh()
 
         msal_account = await self._find_msal_account(home_account_id)
         if msal_account is None:
@@ -560,7 +635,8 @@ class AuthManager:
         a claims challenge). Reuses the same loopback+browser round trip as :meth:`add_account`
         via :meth:`_run_interactive_auth_code_flow`. On success, updates the EXISTING
         :class:`AccountAuthState` in place (never creates a new entry)."""
-        account_state = self.accounts[home_account_id]
+        self._require_started()
+        account_state = self._account_state_or_raise(home_account_id)
 
         # DEVICE_CA_BLOCKED is terminal for this account this session (spec.md section 6.5) --
         # refuse explicitly, with AuthManager's own documented AuthError, rather than letting
