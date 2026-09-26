@@ -45,6 +45,11 @@ their states and results into the behavior the FR acceptance criteria describe.
 - Depends on `app-foundation` (state store, task groups, logging), `auth-account-manager` (account list,
   auth states, active account), and `cloudpc-enumeration` (resource data). Consumes the web/native launchers
   and the actions service through their interfaces; their behavior is specified in their own changes.
+- Depends on `add-state-change-listeners` (applied 2026-09-26): the §4.4 offline banner, per-account
+  ReauthRequired banner, and status-chip updates subscribe via `CloudPcProvider.add_result_listener` and
+  `AuthManager.add_auth_state_listener` rather than polling backend attributes on a UI timer; user-facing
+  error text comes from the backend's `user_message` fields, never from raw error detail (§9). Linear:
+  BIG-341 blocks BIG-287.
 - Owns the per-resource connection-method preference store (keyed by account and resource).
 - Pure-logic pieces (grouping, enablement mapping, preference persistence) are unit-testable; the widget layer
   itself is verified manually per §11.2 (M).

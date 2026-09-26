@@ -334,3 +334,20 @@ def _leaf_string_values(payload):
             yield from _leaf_string_values(item)
     elif isinstance(payload, str):
         yield payload
+
+
+def test_store_io_dispatches_cleanly_through_run_blocking(tmp_path):
+    """Pins the F-21 calling convention (add-state-change-listeners): StateStore's synchronous
+    load/save are dispatched through run_blocking by loop-thread callers -- the documented
+    pattern works end-to-end and returns the same typed results as direct calls."""
+    import asyncio
+
+    from winonlinux.task_registry import run_blocking
+
+    async def scenario():
+        store = _store(tmp_path, schema_version=1, defaults={"windowWidth": 0})
+        await run_blocking(store.save, {"windowWidth": 1280})
+        loaded = await run_blocking(store.load)
+        assert loaded["windowWidth"] == 1280
+
+    asyncio.run(scenario())

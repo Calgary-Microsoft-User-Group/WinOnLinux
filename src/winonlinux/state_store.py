@@ -197,6 +197,10 @@ class StateStore:
 
         Never raises for a missing, corrupt, or newer-than-understood file -- each of those
         cases falls back to in-memory defaults instead.
+
+        Synchronous disk I/O: callers on the event-loop thread dispatch this through
+        ``run_blocking`` (D-18 -- the loop is also GTK's thread, and a slow ``$HOME`` stalls
+        both; add-state-change-listeners, audit F-21).
         """
         path = self.path
         if not path.exists():
@@ -264,6 +268,10 @@ class StateStore:
 
     def save(self, data: Mapping[str, Any]) -> None:
         """Persist ``data`` atomically, refusing the write if it contains secret material.
+
+        Synchronous disk I/O including an fsync -- which can stall for hundreds of
+        milliseconds on a slow or network-backed ``$HOME``: callers on the event-loop thread
+        dispatch this through ``run_blocking`` (D-18; add-state-change-listeners, audit F-21).
 
         Raises
         ------

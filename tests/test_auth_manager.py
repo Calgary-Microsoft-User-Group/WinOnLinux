@@ -149,7 +149,11 @@ def _make_manager(app: FakeMsalApp | None = None) -> tuple[AuthManager, FakeTask
 
 
 def _seeded_account(manager: AuthManager, home_account_id: str, *, login_hint: str | None = None) -> AccountAuthState:
-    state = AccountAuthState(home_account_id, login_hint=login_hint)
+    # Wired through the manager's own notifier (as _new_account_state does in production) so the
+    # add_auth_state_listener tests observe seeded accounts' transitions too.
+    state = AccountAuthState(
+        home_account_id, login_hint=login_hint, on_transition=manager._notify_auth_state_changed
+    )
     state.mark_active(login_hint=login_hint)
     manager.accounts[home_account_id] = state
     return state
@@ -907,3 +911,155 @@ def test_offline_account_recovers_through_silent_refresh():
         assert account_state.state is AuthState.ACTIVE
 
     asyncio.run(scenario())
+
+
+# --- add-state-change-listeners (audit F-08/F-20): auth-state observers, user messages ------------
+
+
+def test_background_invalid_grant_fires_auth_state_listener_with_reauth_required():
+    """The section 4.4 per-account ReauthRequired banner signal: a background silent acquisition
+    classifying INVALID_GRANT notifies (home_account_id, REAUTH_REQUIRED) -- no polling needed."""
+
+    async def scenario():
+        app = FakeMsalApp()
+        home_account_id = "acct-listener-invalid-grant"
+        app.accounts[home_account_id] = {
+            "home_account_id": home_account_id, "username": "user@contoso.com"
+        }
+        app.silent_result_factory = lambda scopes, account: {"error": "invalid_grant"}
+        manager, _ = _make_manager(app)
+        _seeded_account(manager, home_account_id)
+
+        events: list[tuple[str, AuthState]] = []
+        manager.add_auth_state_listener(lambda acct, state: events.append((acct, state)))
+
+        with pytest.raises(ReauthRequiredError):
+            await manager.acquire_token_silently(home_account_id, ["CloudPC.Read.All"])
+
+        assert (home_account_id, AuthState.REAUTH_REQUIRED) in events
+        # The refresh itself was observable too (F-19's SILENT_REFRESH pass-through).
+        assert (home_account_id, AuthState.SILENT_REFRESH) in events
+
+    asyncio.run(scenario())
+
+
+def test_device_ca_blocked_fires_listener_exactly_once():
+    """Entering the terminal state notifies once; later acquisitions short-circuit without any
+    further transition or notification (spec.md section 6.5)."""
+
+    async def scenario():
+        app = FakeMsalApp()
+        home_account_id = "acct-listener-blocked"
+        app.accounts[home_account_id] = {
+            "home_account_id": home_account_id, "username": "user@contoso.com"
+        }
+        app.silent_result_factory = lambda scopes, account: {
+            "error": "interaction_required", "error_codes": [53000]
+        }
+        manager, _ = _make_manager(app)
+        _seeded_account(manager, home_account_id)
+
+        events: list[tuple[str, AuthState]] = []
+        manager.add_auth_state_listener(lambda acct, state: events.append((acct, state)))
+
+        with pytest.raises(DeviceCaBlockedError):
+            await manager.acquire_token_silently(home_account_id, ["CloudPC.Read.All"])
+        with pytest.raises(DeviceCaBlockedError):
+            await manager.acquire_token_silently(home_account_id, ["CloudPC.Read.All"])
+
+        blocked_events = [e for e in events if e[1] is AuthState.DEVICE_CA_BLOCKED]
+        assert blocked_events == [(home_account_id, AuthState.DEVICE_CA_BLOCKED)]
+
+    asyncio.run(scenario())
+
+
+def test_sign_out_fires_listener_with_signed_out():
+    async def scenario():
+        app = FakeMsalApp()
+        home_account_id = "acct-listener-signout"
+        app.accounts[home_account_id] = {
+            "home_account_id": home_account_id, "username": "user@contoso.com"
+        }
+        manager, _ = _make_manager(app)
+        _seeded_account(manager, home_account_id)
+
+        events: list[tuple[str, AuthState]] = []
+        manager.add_auth_state_listener(lambda acct, state: events.append((acct, state)))
+
+        await manager.sign_out(home_account_id)
+
+        assert (home_account_id, AuthState.SIGNED_OUT) in events
+
+    asyncio.run(scenario())
+
+
+def test_raising_auth_state_listener_does_not_break_transition_or_other_listeners():
+    async def scenario():
+        app = FakeMsalApp()
+        home_account_id = "acct-listener-raises"
+        app.accounts[home_account_id] = {
+            "home_account_id": home_account_id, "username": "user@contoso.com"
+        }
+        app.silent_result_factory = lambda scopes, account: {"error": "invalid_grant"}
+        manager, _ = _make_manager(app)
+        account_state = _seeded_account(manager, home_account_id)
+
+        def bad_listener(acct, state):
+            raise RuntimeError("listener bug")
+
+        good_events: list[tuple[str, AuthState]] = []
+        manager.add_auth_state_listener(bad_listener)
+        manager.add_auth_state_listener(lambda acct, state: good_events.append((acct, state)))
+
+        with pytest.raises(ReauthRequiredError):
+            await manager.acquire_token_silently(home_account_id, ["CloudPC.Read.All"])
+
+        # The transition happened and the second listener still heard it.
+        assert account_state.state is AuthState.REAUTH_REQUIRED
+        assert (home_account_id, AuthState.REAUTH_REQUIRED) in good_events
+
+    asyncio.run(scenario())
+
+
+def test_remove_auth_state_listener_stops_notifications():
+    async def scenario():
+        app = FakeMsalApp()
+        home_account_id = "acct-listener-removed"
+        app.accounts[home_account_id] = {
+            "home_account_id": home_account_id, "username": "user@contoso.com"
+        }
+        manager, _ = _make_manager(app)
+
+        events: list[tuple[str, AuthState]] = []
+        listener = lambda acct, state: events.append((acct, state))  # noqa: E731
+        manager.add_auth_state_listener(listener)
+        manager.remove_auth_state_listener(listener)
+        manager.remove_auth_state_listener(listener)  # second removal is a documented no-op
+
+        _seeded_account(manager, home_account_id)  # fires mark_active
+        assert events == []
+
+    asyncio.run(scenario())
+
+
+def test_every_auth_error_type_carries_a_clean_user_message():
+    """Section 9 messaging rules (audit F-20): every AuthError type carries a non-empty
+    user_message with no raw protocol detail (AADSTS codes, HTTP statuses)."""
+    from winonlinux.auth_manager import _USER_MESSAGES
+
+    for exc_type, message in _USER_MESSAGES.items():
+        assert issubclass(exc_type, auth_manager.AuthError)
+        assert exc_type.user_message == message
+        assert message.strip(), f"{exc_type.__name__} has an empty user_message"
+        assert "AADSTS" not in message
+        assert "HTTP" not in message
+
+    # An instance carries it too, and the raw MSAL detail is namespaced for logs only.
+    from winonlinux.auth_errors import MsalErrorCategory
+
+    err = auth_manager.InteractiveSignInFailedError(
+        MsalErrorCategory.UNKNOWN, "AADSTS900000: something raw"
+    )
+    assert "AADSTS" not in err.user_message
+    assert err.raw_error_description_for_logs == "AADSTS900000: something raw"
+    assert not hasattr(err, "raw_error_description")

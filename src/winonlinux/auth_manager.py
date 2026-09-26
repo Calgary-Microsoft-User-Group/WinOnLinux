@@ -226,10 +226,40 @@ class InteractiveSignInFailedError(AuthError):
     exceptions above even pre-account, since those are meaningful without one.
     """
 
-    def __init__(self, category: MsalErrorCategory, raw_error_description: str | None) -> None:
+    def __init__(self, category: MsalErrorCategory, raw_error_description_for_logs: str | None) -> None:
         super().__init__(f"interactive sign-in failed: {category.value}")
         self.category = category
-        self.raw_error_description = raw_error_description
+        # The `_for_logs` suffix is deliberate (add-state-change-listeners, audit F-20): this is
+        # MSAL's raw error_description, typically full of AADSTS codes -- §9 puts it in logs,
+        # never dialogs. The display string is `user_message`, like every AuthError.
+        self.raw_error_description_for_logs = raw_error_description_for_logs
+
+
+# One table owns every user-facing auth message (§9 messaging rules; add-state-change-listeners,
+# audit F-20): raw protocol detail (AADSTS codes, MSAL error_description) stays in logs, these
+# strings are safe to render in dialogs and banners verbatim. Assigned onto each class as its
+# `user_message` attribute below -- a single place to review wording, no per-class drift.
+_USER_MESSAGES: dict[type, str] = {
+    AuthError: "Something went wrong while signing in. Try again.",
+    AuthManagerNotStarted: (
+        "Sign-in is unavailable because no secure system keyring could be reached. A keyring "
+        "is required to store sign-in data safely."
+    ),
+    AccountUnknownError: "This account is no longer signed in.",
+    ReauthRequiredError: "This account needs to be signed in again.",
+    OfflineNoCachedTokenError: "You appear to be offline. Check the connection and try again.",
+    DeviceCaBlockedError: (
+        "This organization requires a managed, compliant device, which this app cannot "
+        "provide. Use the web client on a compliant device instead."
+    ),
+    ConsentRequiredError: (
+        "An administrator of this organization must approve this app before it can be used."
+    ),
+    ClaimsChallengeError: "Additional verification is required. Sign in again to continue.",
+    InteractiveSignInFailedError: "Sign-in did not complete. Try again.",
+}
+for _exc_type, _message in _USER_MESSAGES.items():
+    _exc_type.user_message = _message  # type: ignore[attr-defined]
 
 
 class SignInCancelled(Exception):
@@ -294,6 +324,53 @@ class AuthManager:
         # this synchronous notification.
         self._active_account_listeners: list["Callable[[str], None]"] = []
 
+        # Per-account auth-state transition observers (add-state-change-listeners, audit F-08):
+        # the signal spec §4.4's ReauthRequired banner, DEVICE_CA_BLOCKED notice, and offline
+        # surfacing subscribe through, following add_active_account_listener's idiom. Notified
+        # synchronously on the loop thread from AccountAuthState._transition via the callback
+        # wired in _new_account_state below.
+        self._auth_state_listeners: list["Callable[[str, AuthState], None]"] = []
+
+    def add_auth_state_listener(self, callback: "Callable[[str, AuthState], None]") -> None:
+        """Register ``callback(home_account_id, new_state)`` to be invoked on EVERY auth state
+        transition of every account this manager owns -- background silent-refresh outcomes
+        included, which is exactly what makes the §4.4 per-account banners event-driven instead
+        of polled. Fired after the state is assigned (a callback reading
+        ``accounts[id].state`` sees the new value); exceptions a callback raises are caught and
+        logged, never allowed to affect the transition or other listeners."""
+        self._auth_state_listeners.append(callback)
+
+    def remove_auth_state_listener(self, callback: "Callable[[str, AuthState], None]") -> None:
+        """Unregister a callback previously added with :meth:`add_auth_state_listener`; a no-op
+        if it is not currently registered."""
+        try:
+            self._auth_state_listeners.remove(callback)
+        except ValueError:
+            pass
+
+    def _notify_auth_state_changed(self, home_account_id: str, new_state: AuthState) -> None:
+        for callback in list(self._auth_state_listeners):
+            try:
+                callback(home_account_id, new_state)
+            except Exception:  # noqa: BLE001 - a listener's own bug must never break auth flow
+                logger.exception(
+                    "an auth-state listener raised while handling account %s -> %s",
+                    home_account_id,
+                    new_state.value,
+                )
+
+    def _new_account_state(
+        self, home_account_id: str, *, login_hint: str | None = None
+    ) -> AccountAuthState:
+        """Construct an :class:`AccountAuthState` wired to this manager's state listeners --
+        the ONLY way this class creates account state, so notification cannot be forgotten at
+        one construction site."""
+        return AccountAuthState(
+            home_account_id,
+            login_hint=login_hint,
+            on_transition=self._notify_auth_state_changed,
+        )
+
     def add_active_account_listener(self, callback: "Callable[[str], None]") -> None:
         """Register ``callback(home_account_id)`` to be called whenever the active account is
         established or changes: on :meth:`start`'s startup rebuild (if any cached account exists),
@@ -344,7 +421,7 @@ class AuthManager:
         self.active_account_id = None
         for account in cached_accounts:
             home_account_id = account["home_account_id"]
-            state = AccountAuthState(home_account_id, login_hint=account.get("username"))
+            state = self._new_account_state(home_account_id, login_hint=account.get("username"))
             # A cached account with tokens on disk is presumptively usable until proven otherwise
             # by an actual acquire_token_silently() call -- no interactive prompt at startup
             # (spec.md's "Startup rebuild" scenario).
@@ -416,7 +493,7 @@ class AuthManager:
         home_account_id = await self._resolve_new_home_account_id(result)
         login_hint = _preferred_username(result)
 
-        account_state = AccountAuthState(home_account_id, login_hint=login_hint)
+        account_state = self._new_account_state(home_account_id, login_hint=login_hint)
         account_state.mark_active(login_hint=login_hint)
         self.accounts[home_account_id] = account_state
 
@@ -477,7 +554,13 @@ class AuthManager:
                 home_account_id,
             )
 
-        self.accounts.pop(home_account_id, None)
+        removed_state = self.accounts.pop(home_account_id, None)
+        if removed_state is not None:
+            # Drive the state machine's own sign_out transition on the removed object so
+            # auth-state listeners observe SIGNED_OUT for this account (§4.4 banner teardown,
+            # add-state-change-listeners) -- popping the dict alone would silently strand any
+            # subscriber still rendering the account's last known state.
+            removed_state.sign_out()
         # Keys are (home_account_id, scopes) tuples (see acquire_token_silently) -- drop every
         # entry for this account regardless of which scopes it was keyed under. This does not
         # cancel or otherwise disturb a call already in flight for this account (its `finally`

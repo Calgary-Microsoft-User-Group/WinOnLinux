@@ -48,6 +48,7 @@ import asyncio
 import logging
 from abc import ABC
 from dataclasses import dataclass
+from typing import Callable, ClassVar
 
 from winonlinux import graph_client
 from winonlinux.auth_manager import AccountUnknownError
@@ -144,6 +145,9 @@ class NoLicence(EnumerationResult):
     """Graph returned 404 on ``/me/cloudPCs`` -- no Cloud PC licence assigned (FR-1-AC-3),
     distinct from :class:`Empty`. NOT an error."""
 
+    #: §9's exact empty-state wording -- safe to render verbatim (audit F-20).
+    user_message: ClassVar[str] = "No Cloud PC is assigned to this account."
+
 
 @dataclass(frozen=True)
 class ConsentRequired(EnumerationResult):
@@ -160,6 +164,45 @@ class ConsentRequired(EnumerationResult):
 
     admin_consent_url: str | None
 
+    #: §9's guided admin-consent wording -- safe to render verbatim (audit F-20).
+    user_message: ClassVar[str] = (
+        "An administrator of this organization must approve this app before Cloud PCs can be "
+        "listed."
+    )
+
+
+# Ordered most-specific-first: `Failed.user_message` resolves the wrapped error against this via
+# isinstance (§9 messaging rules; add-state-change-listeners, audit F-20). The proxy entry is
+# §5.9's requirement made concrete: a proxy failure is NAMED as such, never rendered as plain
+# offline.
+_FAILED_USER_MESSAGES: tuple[tuple[type, str], ...] = (
+    (
+        graph_client.GraphProxyError,
+        "A network proxy blocked the connection to Microsoft's service (the app's logs show "
+        "the proxy configuration it detected). The list shows the last known state.",
+    ),
+    (
+        graph_client.GraphThrottled,
+        "Microsoft's service asked the app to slow down. The list will refresh again "
+        "automatically.",
+    ),
+    (
+        graph_client.GraphNetworkError,
+        "The network appears to be offline. The list shows the last known state.",
+    ),
+    (
+        graph_client.GraphError,
+        "The Cloud PC list could not be refreshed. The list shows the last known state.",
+    ),
+)
+
+#: §9's "beta contract change" wording, for a Failed wrapping a non-Graph parse error
+#: (KeyError/TypeError/ValueError from an unexpected /me/cloudPCs shape).
+_CONTRACT_CHANGE_USER_MESSAGE = (
+    "Microsoft's service returned data in an unexpected format (a Microsoft API change). "
+    "Check for an app update."
+)
+
 
 @dataclass(frozen=True)
 class Failed(EnumerationResult):
@@ -173,6 +216,16 @@ class Failed(EnumerationResult):
 
     error: Exception
     previous_entries: list[CloudPcEntry]
+
+    @property
+    def user_message(self) -> str:
+        """User-presentable text for this failure, resolved from the wrapped error's type via
+        :data:`_FAILED_USER_MESSAGES` (§9: raw error detail goes to logs, this string goes to
+        the error indicator). Never contains status codes or exception text."""
+        for error_type, message in _FAILED_USER_MESSAGES:
+            if isinstance(self.error, error_type):
+                return message
+        return _CONTRACT_CHANGE_USER_MESSAGE
 
 
 # --- Provider ----------------------------------------------------------------------------------
@@ -217,15 +270,62 @@ class CloudPcProvider:
         self._poll_task: "asyncio.Task[None] | None" = None
         self._poll_account_id: str | None = None
 
+        # Refresh-outcome observers (add-state-change-listeners, audit F-07) -- see
+        # add_result_listener below.
+        self._result_listeners: list["Callable[[str, EnumerationResult], None]"] = []
+
     def last_result_for(self, home_account_id: str) -> EnumerationResult | None:
         """The last non-``Failed`` result recorded for ``home_account_id``, or ``None`` before
         that account's first refresh completes. Strictly per-account (FR-3): a reader never
         receives another account's data (fix-account-lifecycle, audit F-04)."""
         return self._last_results.get(home_account_id)
 
+    # -- result observers (add-state-change-listeners, audit F-07) -------------------------------
+
+    def add_result_listener(self, callback: "Callable[[str, EnumerationResult], None]") -> None:
+        """Register ``callback(home_account_id, result)`` to be invoked with EVERY refresh
+        outcome -- manual, post-action, and background poll ticks; ``Failed`` included. This is
+        the channel that makes §4.4's offline banner and §4.3's status chips event-driven: a
+        failing poll tick reaches subscribers here even though it never overwrites
+        :meth:`last_result_for`'s last-known-good entry (FR-1-AC-4). Fired synchronously on the
+        loop thread; exceptions a callback raises are caught and logged, never allowed to affect
+        the result or other listeners. ``AuthError`` exceptions propagating out of
+        :meth:`refresh_now` do NOT come through here -- those are the auth-state listener's
+        domain (``AuthManager.add_auth_state_listener``)."""
+        self._result_listeners.append(callback)
+
+    def remove_result_listener(self, callback: "Callable[[str, EnumerationResult], None]") -> None:
+        """Unregister a callback previously added with :meth:`add_result_listener`; a no-op if
+        it is not currently registered."""
+        try:
+            self._result_listeners.remove(callback)
+        except ValueError:
+            pass
+
+    def _notify_result(self, home_account_id: str, result: EnumerationResult) -> None:
+        for callback in list(self._result_listeners):
+            try:
+                callback(home_account_id, result)
+            except Exception:  # noqa: BLE001 - a listener's own bug must never corrupt a refresh
+                logger.exception(
+                    "a result listener raised while handling account %s's %s",
+                    home_account_id,
+                    type(result).__name__,
+                )
+
     # -- core paged fetch (tasks.md 2.1-2.3) -----------------------------------------------------
 
     async def refresh_now(self, home_account_id: str) -> EnumerationResult:
+        """Fetch every page of ``/me/cloudPCs`` for ``home_account_id``, notify every registered
+        result listener with the typed outcome (add-state-change-listeners, audit F-07), and
+        return it. The full contract lives on :meth:`_do_refresh`, whose result this wrapper
+        passes through unchanged; an ``AuthError`` propagating out of the refresh bypasses
+        notification entirely (auth failures travel via the auth-state listener instead)."""
+        result = await self._do_refresh(home_account_id)
+        self._notify_result(home_account_id, result)
+        return result
+
+    async def _do_refresh(self, home_account_id: str) -> EnumerationResult:
         """Fetch every page of ``/me/cloudPCs`` for ``home_account_id`` and return a typed result.
 
         Paging (FR-1-AC-1): follows ``@odata.nextLink`` from each page's JSON body to exhaustion,

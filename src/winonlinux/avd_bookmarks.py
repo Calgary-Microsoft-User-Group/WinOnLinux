@@ -147,6 +147,10 @@ class BookmarkStore:
         Returns an empty list (never raises) when the store does not exist yet. Any individual
         entry that fails validation is skipped and logged at WARNING -- one admin typo must not
         take down the whole list.
+
+        Synchronous disk I/O (delegates to ``StateStore.load``): callers on the event-loop
+        thread dispatch this through ``run_blocking`` (D-18; add-state-change-listeners,
+        audit F-21).
         """
         data = self._store.load()
         raw_entries = data.get("bookmarks", [])

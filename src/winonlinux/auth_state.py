@@ -114,13 +114,24 @@ class AccountAuthState:
     nothing outside this class should assign to ``.state`` or the ``pending_*`` fields directly.
     """
 
-    def __init__(self, home_account_id: str, *, login_hint: str | None = None) -> None:
+    def __init__(
+        self,
+        home_account_id: str,
+        *,
+        login_hint: str | None = None,
+        on_transition: "Callable[[str, AuthState], None] | None" = None,
+    ) -> None:
         self._home_account_id = home_account_id
         self._login_hint = login_hint
         self._state = AuthState.SIGNED_OUT
         self._pending_claims: str | None = None
         self._pending_admin_consent_url: str | None = None
         self._retry_count = 0
+        # Fired as (home_account_id, new_state) AFTER every state assignment -- the single
+        # notification point spec §4.4's per-account UI states subscribe through
+        # (add-state-change-listeners, audit F-08). An exception it raises is caught and logged
+        # here, never allowed to corrupt the transition that fired it.
+        self._on_transition = on_transition
 
     # -- read-only view --------------------------------------------------------
 
@@ -165,8 +176,7 @@ class AccountAuthState:
                 f"account {self._home_account_id}: cannot begin interactive auth from "
                 "DEVICE_CA_BLOCKED -- this state is terminal for the session; sign_out() first"
             )
-        self._log_transition("begin_interactive", AuthState.INTERACTIVE_AUTH)
-        self._state = AuthState.INTERACTIVE_AUTH
+        self._transition("begin_interactive", AuthState.INTERACTIVE_AUTH)
 
     def mark_active(self, *, login_hint: str | None = None) -> None:
         """Record a successful (re)authentication -> ACTIVE.
@@ -181,13 +191,14 @@ class AccountAuthState:
         """
         if self._blocked_guard("mark_active"):
             return
-        self._log_transition("mark_active", AuthState.ACTIVE)
-        self._state = AuthState.ACTIVE
+        # Fields settle BEFORE the transition fires: a listener reacting to ACTIVE reads the
+        # already-cleared pending state, not a half-updated account.
         self._pending_claims = None
         self._pending_admin_consent_url = None
         self._retry_count = 0
         if login_hint is not None:
             self._login_hint = login_hint
+        self._transition("mark_active", AuthState.ACTIVE)
 
     def begin_silent_refresh(self) -> None:
         """ACTIVE/OFFLINE -> SILENT_REFRESH. A marker only -- callers still call
@@ -197,8 +208,7 @@ class AccountAuthState:
         DEVICE_CA_BLOCKED account (§6.5, audit F-14)."""
         if self._blocked_guard("begin_silent_refresh"):
             return
-        self._log_transition("begin_silent_refresh", AuthState.SILENT_REFRESH)
-        self._state = AuthState.SILENT_REFRESH
+        self._transition("begin_silent_refresh", AuthState.SILENT_REFRESH)
 
     def apply_error(self, classified: ClassifiedMsalError) -> AuthState:
         """Drive the §6.4 transition table from a classified MSAL error.
@@ -216,8 +226,7 @@ class AccountAuthState:
 
         handler = _TRANSITIONS.get(classified.category, _on_invalid_grant)
         new_state = handler(self, classified)
-        self._log_transition(f"apply_error[{classified.category.value}]", new_state)
-        self._state = new_state
+        self._transition(f"apply_error[{classified.category.value}]", new_state)
         return new_state
 
     def mark_offline(self) -> None:
@@ -226,17 +235,15 @@ class AccountAuthState:
         DEVICE_CA_BLOCKED account (§6.5, audit F-14)."""
         if self._blocked_guard("mark_offline"):
             return
-        self._log_transition("mark_offline", AuthState.OFFLINE)
-        self._state = AuthState.OFFLINE
+        self._transition("mark_offline", AuthState.OFFLINE)
 
     def sign_out(self) -> None:
         """-> SIGNED_OUT, clearing everything: pending claims/consent, retry count, login hint."""
-        self._log_transition("sign_out", AuthState.SIGNED_OUT)
-        self._state = AuthState.SIGNED_OUT
         self._pending_claims = None
         self._pending_admin_consent_url = None
         self._retry_count = 0
         self._login_hint = None
+        self._transition("sign_out", AuthState.SIGNED_OUT)
 
     # -- internal -------------------------------------------------------------
 
@@ -257,10 +264,16 @@ class AccountAuthState:
         )
         return True
 
-    def _log_transition(self, trigger: str, new_state: AuthState) -> None:
-        # Account identifiers and state transitions are logged freely; token/claims *values* never
-        # are -- only the fact that a claims challenge or consent URL is now pending, never its
-        # content (spec.md §10.7).
+    def _transition(self, trigger: str, new_state: AuthState) -> None:
+        """Log, assign, and notify -- THE single point every state assignment passes through
+        (add-state-change-listeners, audit F-08), so notification can never drift from reality.
+
+        Account identifiers and state transitions are logged freely; token/claims *values* never
+        are -- only the fact that a claims challenge or consent URL is now pending, never its
+        content (spec.md §10.7). The callback fires AFTER the assignment (a listener reading
+        ``.state`` sees the new value) and its exceptions are caught and logged, never allowed to
+        corrupt the transition or bubble into auth flow.
+        """
         logger.debug(
             "account %s: %s -> %s via %s",
             self._home_account_id,
@@ -268,3 +281,13 @@ class AccountAuthState:
             new_state.value,
             trigger,
         )
+        self._state = new_state
+        if self._on_transition is not None:
+            try:
+                self._on_transition(self._home_account_id, new_state)
+            except Exception:  # noqa: BLE001 - a listener's bug must never corrupt a transition
+                logger.exception(
+                    "account %s: a state-transition listener raised on %s",
+                    self._home_account_id,
+                    new_state.value,
+                )

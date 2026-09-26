@@ -551,3 +551,131 @@ def test_poll_loop_ends_terminally_on_account_unknown_error(monkeypatch):
         assert task.done() and not task.cancelled()
 
     asyncio.run(scenario())
+
+
+# --- result listeners (add-state-change-listeners, audit F-07) -----------------------------------
+
+
+def test_result_listener_notified_on_success_and_on_poll_tick_failure(monkeypatch):
+    """Every refresh outcome reaches listeners -- including a background poll tick's Failed,
+    which never overwrites the stored last-known-good result (FR-1-AC-4). This is the section
+    4.4 offline-banner signal."""
+    page = _load_fixture("cloudpcs_page2.json")
+    calls = {"count": 0}
+
+    async def fake_graph_get_json(url, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return page
+        raise graph_client.GraphNetworkError("network unreachable")
+
+    monkeypatch.setattr(cloudpc_provider.graph_client, "graph_get_json", fake_graph_get_json)
+
+    async def scenario():
+        provider = _make_provider(poll_interval_seconds=0.01)
+        events: list[tuple[str, object]] = []
+        provider.add_result_listener(lambda acct, result: events.append((acct, result)))
+
+        first = await provider.refresh_now(FAKE_ACCOUNT)
+        assert isinstance(first, Enumerated)
+        assert events == [(FAKE_ACCOUNT, first)]
+
+        # A background poll tick's failure reaches listeners even though it is returned to no
+        # direct caller.
+        provider.start_polling(FAKE_ACCOUNT)
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(events) >= 2:
+                break
+        provider.stop_polling()
+
+        assert len(events) >= 2
+        account_id, poll_result = events[1]
+        assert account_id == FAKE_ACCOUNT
+        assert isinstance(poll_result, Failed)
+        assert poll_result.previous_entries == first.entries
+        # The stored last-known-good entry is untouched by the notified failure.
+        assert provider.last_result_for(FAKE_ACCOUNT) is first
+
+    asyncio.run(scenario())
+
+
+def test_raising_result_listener_does_not_break_refresh_or_other_listeners(monkeypatch):
+    async def fake_graph_get_json(url, **kwargs):
+        return {"value": []}
+
+    monkeypatch.setattr(cloudpc_provider.graph_client, "graph_get_json", fake_graph_get_json)
+
+    async def scenario():
+        provider = _make_provider()
+
+        def bad_listener(acct, result):
+            raise RuntimeError("listener bug")
+
+        good_events: list[object] = []
+        provider.add_result_listener(bad_listener)
+        provider.add_result_listener(lambda acct, result: good_events.append(result))
+
+        result = await provider.refresh_now(FAKE_ACCOUNT)
+
+        assert isinstance(result, Empty)
+        assert good_events == [result]
+        assert provider.last_result_for(FAKE_ACCOUNT) is result
+
+    asyncio.run(scenario())
+
+
+def test_remove_result_listener_stops_notifications(monkeypatch):
+    async def fake_graph_get_json(url, **kwargs):
+        return {"value": []}
+
+    monkeypatch.setattr(cloudpc_provider.graph_client, "graph_get_json", fake_graph_get_json)
+
+    async def scenario():
+        provider = _make_provider()
+        events: list[object] = []
+        listener = lambda acct, result: events.append(result)  # noqa: E731
+        provider.add_result_listener(listener)
+        provider.remove_result_listener(listener)
+        provider.remove_result_listener(listener)  # second removal is a documented no-op
+
+        await provider.refresh_now(FAKE_ACCOUNT)
+        assert events == []
+
+    asyncio.run(scenario())
+
+
+# --- user-presentable messages (add-state-change-listeners, audit F-20) --------------------------
+
+
+def test_failure_shaped_results_carry_clean_user_messages():
+    """Section 9 messaging rules: proxy failures NAMED as such (never plain offline, section
+    5.9), no-licence wording verbatim, contract changes as 'Microsoft API change' -- and no raw
+    codes anywhere."""
+    proxy = Failed(error=graph_client.GraphProxyError("x"), previous_entries=[])
+    network = Failed(error=graph_client.GraphNetworkError("x"), previous_entries=[])
+    throttled = Failed(error=graph_client.GraphThrottled("x"), previous_entries=[])
+    generic = Failed(error=graph_client.GraphError("x"), previous_entries=[])
+    contract = Failed(error=KeyError("id"), previous_entries=[])
+
+    assert "proxy" in proxy.user_message.lower()
+    assert proxy.user_message != network.user_message  # proxy never reported as plain offline
+    assert "slow" in throttled.user_message.lower() or "busy" in throttled.user_message.lower()
+    assert "API change" in contract.user_message
+
+    assert "No Cloud PC is assigned to this account" in NoLicence.user_message
+    assert "administrator" in ConsentRequired(admin_consent_url=None).user_message
+
+    for message in (
+        proxy.user_message,
+        network.user_message,
+        throttled.user_message,
+        generic.user_message,
+        contract.user_message,
+        NoLicence.user_message,
+        ConsentRequired(admin_consent_url=None).user_message,
+    ):
+        assert message.strip()
+        assert "AADSTS" not in message
+        assert "HTTP" not in message
+        assert "403" not in message and "404" not in message and "429" not in message
