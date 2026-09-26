@@ -48,6 +48,7 @@ from winonlinux.avd_bookmarks import BookmarkStore
 from winonlinux.cloudpc_provider import CloudPcProvider
 from winonlinux.freerdp_probe import FreeRdpProbeResult
 from winonlinux.freerdp_probe import probe as probe_freerdp
+from winonlinux.logging_setup import configure_logging
 from winonlinux.state_store import StateStore
 from winonlinux.task_registry import TaskRegistry
 
@@ -366,6 +367,11 @@ def main(argv: list[str] | None = None) -> int:
     task registry, or token cache in that process (see module docstring).
     """
     cold_start_reference = time.monotonic()
+    # Redaction is installed HERE, not only in __main__.py, so every way of starting the app --
+    # `python -m winonlinux` and direct execution of this file alike -- runs with the §10.7
+    # record factory in place before any component logs (fix-redaction-hardening, audit F-15).
+    # configure_logging() is idempotent, so the __main__.py call remains harmless.
+    configure_logging()
     app = WinOnLinuxApplication(cold_start_reference=cold_start_reference)
     return app.run(argv if argv is not None else sys.argv)
 

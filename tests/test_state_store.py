@@ -351,3 +351,41 @@ def test_store_io_dispatches_cleanly_through_run_blocking(tmp_path):
         assert loaded["windowWidth"] == 1280
 
     asyncio.run(scenario())
+
+
+# --- embedded-secret refusal (fix-redaction-hardening, audit F-11) --------------------------
+
+
+FAKE_EMBEDDED_JWT = (
+    "eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiYzEyMyJ9."
+    "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ."
+    "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+)
+
+
+def test_save_refuses_jwt_embedded_in_a_longer_string(tmp_path):
+    """The realistic accident this control exists for: a token concatenated into a diagnostic
+    string under an innocuous key. The write is refused and the file untouched."""
+    store = _store(tmp_path, schema_version=1, defaults={})
+    store.save({"note": "everything fine"})
+    before = store.path.read_text(encoding="utf-8")
+
+    with pytest.raises(SecretValueRejected):
+        store.save({"data": f"debug note: {FAKE_EMBEDDED_JWT} (from session)"})
+
+    assert store.path.read_text(encoding="utf-8") == before
+
+
+def test_save_refuses_opaque_run_embedded_in_a_longer_string(tmp_path):
+    store = _store(tmp_path, schema_version=1, defaults={})
+    opaque = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0"
+    with pytest.raises(SecretValueRejected):
+        store.save({"data": f"token was {opaque} apparently"})
+
+
+def test_save_accepts_guid_embedded_in_prose(tmp_path):
+    """The UUID carve-out applies to embedded matches too: resource ids inside longer strings
+    are legitimate, persistable data."""
+    store = _store(tmp_path, schema_version=1, defaults={})
+    store.save({"lastSelected": "resource 550e8400-e29b-41d4-a716-446655440000 in workspace"})
+    assert "550e8400" in store.path.read_text(encoding="utf-8")

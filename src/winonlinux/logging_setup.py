@@ -104,6 +104,24 @@ _JWT_PATTERN = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z
 # internal whitespace. 32 chars is a deliberately low floor to prefer over-redaction.
 _OPAQUE_TOKEN_PATTERN = re.compile(r"\b[A-Za-z0-9_-]{32,}\b")
 
+# Canonical UUIDs (8-4-4-4-12 hex) are EXCLUDED from the opaque-token sub above -- Cloud PC ids,
+# tenant/object ids, and `home_account_id` (`oid.tid`, a dotted UUID pair) are the log lines'
+# primary correlators, and redacting them blinds exactly the per-account diagnosis spec.md §9
+# depends on (fix-redaction-hardening, audit F-02; mirrors state_store.py's persistence-side
+# carve-out). The lookarounds (not `\b`) mean a UUID-shaped run EMBEDDED in a longer token-charset
+# run is NOT carved out -- it stays part of that run and dies with it; and _JWT_PATTERN /
+# _AUTH_HEADER_PATTERN run before this carve-out, so a real token containing a UUID-shaped
+# segment is already fully redacted by the time this pattern looks at the text.
+_UUID_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"(?![A-Za-z0-9_-])"
+)
+
+# Placeholder wrapping for the carve-out: \x00 never appears in any pattern's charset, so a
+# stashed UUID cannot be re-matched (or partially matched) while substitutions run.
+_UUID_PLACEHOLDER = "\x00uuid{index}\x00"
+
 # `Authorization: Bearer <...>` / `Authorization=Basic <...>` / dict-style `'Authorization': '...'`.
 # Consumes the whole value token (scheme + credential) so nothing sensitive survives the sub. The
 # optional `["']?` between the key and the separator matches dict/JSON-repr shapes where the key
@@ -162,7 +180,20 @@ def _redact_text(text: str, *, verbose: bool) -> str:
 
     text = _AUTH_HEADER_PATTERN.sub(f"Authorization: {REDACTION_MARKER}", text)
     text = _JWT_PATTERN.sub(REDACTION_MARKER, text)
+
+    # Stash canonical UUIDs behind placeholders so the opaque-token sub cannot eat them, then
+    # restore -- resource ids survive, token-shaped runs die (audit F-02; see _UUID_PATTERN).
+    stashed_uuids: list[str] = []
+
+    def _stash_uuid(match: "re.Match[str]") -> str:
+        stashed_uuids.append(match.group(0))
+        return _UUID_PLACEHOLDER.format(index=len(stashed_uuids) - 1)
+
+    text = _UUID_PATTERN.sub(_stash_uuid, text)
     text = _OPAQUE_TOKEN_PATTERN.sub(REDACTION_MARKER, text)
+    for index, uuid_value in enumerate(stashed_uuids):
+        text = text.replace(_UUID_PLACEHOLDER.format(index=index), uuid_value)
+
     if not verbose:
         text = _UPN_PATTERN.sub(REDACTION_MARKER, text)
     return text

@@ -75,6 +75,28 @@ _UUID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
+# Unanchored variants (fix-redaction-hardening, audit F-11): the anchored patterns above only
+# catch a whole-value token, but the realistic accident this control exists for is a caller
+# concatenating a token INTO a longer string (e.g. a diagnostic note). These mirror
+# logging_setup's unanchored forms: the JWT variant requires the `eyJ` header prefix real JWTs
+# carry (keeping prose false-positives near zero), and every embedded opaque-run match is
+# re-checked against _UUID_PATTERN so bare GUIDs inside longer strings still persist. Ambiguity
+# resolves toward refusal, per D-13's posture -- the refusal message names the key path so the
+# caller can fix its data.
+_EMBEDDED_JWT_PATTERN = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+)
+_EMBEDDED_OPAQUE_TOKEN_PATTERN = re.compile(r"\b[A-Za-z0-9_-]{32,}\b")
+
+
+def _contains_embedded_secret(value: str) -> bool:
+    if _EMBEDDED_JWT_PATTERN.search(value):
+        return True
+    return any(
+        not _UUID_PATTERN.match(match.group(0))
+        for match in _EMBEDDED_OPAQUE_TOKEN_PATTERN.finditer(value)
+    )
+
 #: A migration step: takes the store dict as it existed at ``schemaVersion == from_version`` and
 #: returns the dict upgraded to ``from_version + 1``. Must carry forward every field it does not
 #: intentionally drop -- migrations are forward-only, so this is the only chance to preserve data.
@@ -127,6 +149,7 @@ def _find_secret(value: Any, key_path: str = "$") -> tuple[str, Any] | None:
     if isinstance(value, str) and (
         _JWT_LIKE_PATTERN.match(value)
         or (_OPAQUE_TOKEN_LIKE_PATTERN.match(value) and not _UUID_PATTERN.match(value))
+        or _contains_embedded_secret(value)
     ):
         return key_path, value
 
@@ -196,7 +219,11 @@ class StateStore:
         """Load the store, migrating it forward in place if it is older than understood.
 
         Never raises for a missing, corrupt, or newer-than-understood file -- each of those
-        cases falls back to in-memory defaults instead.
+        cases falls back to in-memory defaults instead. It DOES raise for a migration gap:
+        ``KeyError`` when no migration step is registered to carry an old on-disk version
+        forward (deliberate -- raising beats silently losing data; see ``_migrate``), and the
+        migration rewrite can surface ``OSError`` (e.g. a full disk). Docstring corrected per
+        the 2026-09-22 audit (F-26); the behavior itself is unchanged and test-pinned.
 
         Synchronous disk I/O: callers on the event-loop thread dispatch this through
         ``run_blocking`` (D-18 -- the loop is also GTK's thread, and a slow ``$HOME`` stalls

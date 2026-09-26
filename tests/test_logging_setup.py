@@ -241,3 +241,77 @@ def test_authorization_header_redacted_in_dict_repr_shape(caplog, test_logger):
         )
     assert short_basic_credential not in caplog.text
     assert REDACTION_MARKER in caplog.text
+
+
+# --- GUID carve-out (fix-redaction-hardening, audit F-02) -----------------------------------
+
+
+FAKE_CLOUDPC_GUID = "550e8400-e29b-41d4-a716-446655440000"
+FAKE_HOME_ACCOUNT_ID = "550e8400-e29b-41d4-a716-446655440000.11112222-3333-4444-5555-666677778888"
+
+
+def test_bare_guid_survives_redaction(caplog, test_logger):
+    """Cloud PC ids are the log lines' primary correlators -- they must survive verbatim while
+    token shapes die (the audit's acceptance bar for F-02)."""
+    configure_logging(verbose=False)
+    with caplog.at_level(logging.DEBUG):
+        test_logger.info("cloudpc id %s changed status", FAKE_CLOUDPC_GUID)
+    assert FAKE_CLOUDPC_GUID in caplog.text
+    assert REDACTION_MARKER not in caplog.text
+
+
+def test_dotted_uuid_pair_home_account_id_survives_redaction(caplog, test_logger):
+    configure_logging(verbose=False)
+    with caplog.at_level(logging.DEBUG):
+        test_logger.info("account %s: silent acquisition ok", FAKE_HOME_ACCOUNT_ID)
+    assert FAKE_HOME_ACCOUNT_ID in caplog.text
+    assert REDACTION_MARKER not in caplog.text
+
+
+def test_guid_survives_while_opaque_token_on_same_line_dies(caplog, test_logger):
+    configure_logging(verbose=False)
+    with caplog.at_level(logging.DEBUG):
+        test_logger.info("id %s token %s", FAKE_CLOUDPC_GUID, FAKE_OPAQUE_TOKEN)
+    assert FAKE_CLOUDPC_GUID in caplog.text
+    token_leaked = FAKE_OPAQUE_TOKEN in caplog.text
+    assert not token_leaked
+    assert REDACTION_MARKER in caplog.text
+
+
+def test_undashed_long_run_still_redacted(caplog, test_logger):
+    configure_logging(verbose=False)
+    undashed = "A" * 40
+    with caplog.at_level(logging.DEBUG):
+        test_logger.info("suspicious value %s", undashed)
+    leaked = undashed in caplog.text
+    assert not leaked
+    assert REDACTION_MARKER in caplog.text
+
+
+def test_jwt_embedding_a_uuid_shaped_segment_is_fully_redacted(caplog, test_logger):
+    """The carve-out must not create a bypass: a JWT whose payload segment contains a
+    UUID-shaped substring is still redacted in full (the JWT pattern wins before the carve-out
+    runs)."""
+    configure_logging(verbose=False)
+    jwt_with_uuid = (
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiYzEyMyJ9."
+        f"eyJvaWQiOiI{FAKE_CLOUDPC_GUID.replace('-', '')}xyz1234567890."
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    )
+    with caplog.at_level(logging.DEBUG):
+        test_logger.info("raw result %s", jwt_with_uuid)
+    leaked = jwt_with_uuid in caplog.text
+    assert not leaked
+    assert REDACTION_MARKER in caplog.text
+
+
+def test_uuid_embedded_inside_a_longer_token_run_is_not_carved_out(caplog, test_logger):
+    """A canonical-UUID substring INSIDE a longer base64url run stays part of that run and dies
+    with it -- the carve-out's lookarounds require the UUID to stand alone."""
+    configure_logging(verbose=False)
+    token_with_uuid = f"abcdefgh{FAKE_CLOUDPC_GUID}ijklmnopqrstuvwxyz0123"
+    with caplog.at_level(logging.DEBUG):
+        test_logger.info("value %s", token_with_uuid)
+    leaked = FAKE_CLOUDPC_GUID in caplog.text
+    assert not leaked
+    assert REDACTION_MARKER in caplog.text
