@@ -52,6 +52,7 @@ from winonlinux.logging_setup import configure_logging
 from winonlinux.method_prefs import MethodPreferenceStore
 from winonlinux.state_store import StateStore
 from winonlinux.task_registry import TaskRegistry
+from winonlinux.web_launcher import WebLauncher
 
 __all__ = [
     "APPLICATION_ID",
@@ -153,6 +154,10 @@ class WinOnLinuxApplication(Adw.Application):
         #: until the single-instance check confirms this process is primary.
         self.method_prefs: MethodPreferenceStore | None = None
 
+        #: Web launcher (add-web-launcher change, FR-2/§5.3). Same construction discipline;
+        #: the §7.2 beta launch-detail fast path stays at its default (off).
+        self.web_launcher: WebLauncher | None = None
+
         self.connect("activate", self._on_activate)
 
     # -- signal handlers -----------------------------------------------------
@@ -240,6 +245,10 @@ class WinOnLinuxApplication(Adw.Application):
         # Per-resource connect-method preferences (add-ui-shell change, FR-2-AC-2, D-13).
         # Construction alone does no I/O; MainWindow schedules the load off the loop thread.
         self.method_prefs = MethodPreferenceStore()
+
+        # Web launcher (add-web-launcher change): URL composition + browser handoff. The beta
+        # launch-detail fast path defaults off (§7.2); construction alone does no I/O.
+        self.web_launcher = WebLauncher(auth_manager=self.auth_manager)
 
         # The real §4 window (add-ui-shell change): account switcher, banners, grouped resource
         # list, all bound to the state/result listeners. Imported here rather than at module

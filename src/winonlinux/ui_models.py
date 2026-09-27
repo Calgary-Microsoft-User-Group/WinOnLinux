@@ -17,10 +17,11 @@ Two invariants are made structurally unrepresentable rather than merely followed
   build has never heard of -- renders not connectable. The full status × action matrix is
   outstanding (G-19, P1); it drops in as data here, not as new mechanism.
 
-Launcher/actions reality of this build: ``add-web-launcher``, ``add-native-launcher``, and
-``add-cloudpc-actions`` are unapplied, so :data:`BUILD_LAUNCHERS` and
-:data:`ACTIONS_SERVICE_AVAILABILITY` describe both dispatch paths as unavailable-with-reason.
-Those changes flip these inputs when they land; nothing else in this module changes.
+Launcher/actions reality of this build: web launch is live (``add-web-launcher``, applied);
+``add-native-launcher`` and ``add-cloudpc-actions`` are unapplied, so :data:`BUILD_LAUNCHERS`'s
+native half and :data:`ACTIONS_SERVICE_AVAILABILITY` describe those dispatch paths as
+unavailable-with-reason. Those changes flip these inputs when they land; nothing else in this
+module changes.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ __all__ = [
     "ConnectMethod",
     "LauncherAvailability",
     "BUILD_LAUNCHERS",
+    "AVD_IDS_UNKNOWN_REASON",
     "ACTIONS_SERVICE_AVAILABILITY",
     "CONNECTABLE_CLOUDPC_STATUSES",
     "UiState",
@@ -102,12 +104,19 @@ class LauncherAvailability:
     web: Availability
 
 
-#: This build ships no launcher changes yet: both methods carry honest reasons. FR-2-AC-1's
-#: disabled-never-hidden rendering makes that visible instead of mysterious.
+#: What this build can dispatch. Web is live (add-web-launcher, applied); native arrives
+#: with add-native-launcher (gated on Stage 0/1) and stays disabled-with-reason until then
+#: (FR-2-AC-1's disabled-never-hidden rendering makes that visible instead of mysterious).
 BUILD_LAUNCHERS = LauncherAvailability(
     native=Availability(False, "Native connection support is not included in this build yet"),
-    web=Availability(False, "Web launch support is not included in this build yet"),
+    web=Availability(True),
 )
+
+#: FR-2-AC-1 reason for an AVD entry whose admin-provisioned IDs are missing/blank -- exact
+#: wording from the web-launch spec (add-web-launcher tasks.md 4.1). BookmarkStore validation
+#: normally prevents this shape from loading at all; the state stays representable so a future
+#: bookmark source with laxer validation cannot silently compose a broken URL.
+AVD_IDS_UNKNOWN_REASON = "Web launch unavailable: workspace/resource ID unknown"
 
 #: Same for the Cloud PC management actions service (add-cloudpc-actions, unapplied).
 ACTIONS_SERVICE_AVAILABILITY = Availability(
@@ -141,6 +150,7 @@ class ResourceRow:
     key: str
     title: str
     type_label: str  # "Cloud PC" / "Desktop" / "RemoteApp"
+    kind: str  # "cloudpc" | "desktop" | "remoteapp" -- what the launch dispatch keys on
     status: str | None  # raw Graph status for the chip; None for AVD bookmarks (no live status)
     methods: dict[ConnectMethod, Availability]
     actions: dict[str, Availability]  # empty for AVD bookmarks (§4.3 is Cloud PC only)
@@ -415,6 +425,7 @@ def build_groups(
                 key=cloudpc_resource_key(entry),
                 title=entry.display_name or entry.id,
                 type_label="Cloud PC",
+                kind="cloudpc",
                 status=entry.status or None,
                 methods=connect_methods(cloudpc_connect_gate(entry.status), launchers),
                 actions=cloudpc_actions(
@@ -426,21 +437,30 @@ def build_groups(
         groups.append(ResourceGroup(provider="Windows 365", workspace=None, rows=rows))
 
     for workspace_id, workspace_bookmarks in group_by_workspace(bookmarks).items():
-        rows = [
-            ResourceRow(
-                key=avd_resource_key(bookmark),
-                title=bookmark.display_name,
-                type_label=_KIND_TYPE_LABELS.get(bookmark.kind, bookmark.kind),
-                status=None,
-                methods=connect_methods(
-                    Availability(True),
-                    launchers,
-                    native_override_reason=NATIVE_DISABLED_REASON,
-                ),
-                actions={},
+        rows = []
+        for bookmark in workspace_bookmarks:
+            # FR-2-AC-1 (web-launch spec): no admin-provisioned IDs -> web disabled with the
+            # stated reason, never hidden, and no URL is ever composed for it.
+            ids_gate = (
+                Availability(True)
+                if bookmark.workspace_id and bookmark.resource_id
+                else Availability(False, AVD_IDS_UNKNOWN_REASON)
             )
-            for bookmark in workspace_bookmarks
-        ]
+            rows.append(
+                ResourceRow(
+                    key=avd_resource_key(bookmark),
+                    title=bookmark.display_name,
+                    type_label=_KIND_TYPE_LABELS.get(bookmark.kind, bookmark.kind),
+                    kind=bookmark.kind,
+                    status=None,
+                    methods=connect_methods(
+                        ids_gate,
+                        launchers,
+                        native_override_reason=NATIVE_DISABLED_REASON,
+                    ),
+                    actions={},
+                )
+            )
         groups.append(
             ResourceGroup(provider="Azure Virtual Desktop", workspace=workspace_id, rows=rows)
         )

@@ -67,6 +67,11 @@ Broker-based support for device-Conditional-Access tenants is committed and sche
 
 These are deliberate, recorded decisions rather than gaps to be discovered later:
 
+- **Web launches place your sign-in name (UPN) in the URL fragment.** Launch URLs end with
+  `#loginHint=<your UPN>` so the browser lands on the right account without an account picker. The fragment is
+  never transmitted in the HTTP request (spec.md §10.5), but it **does enter your browser history** — anyone able
+  to read that history can see which account launched a session. This is the recorded §10.5 trade-off; clear
+  browser history if that matters in your environment.
 - **Tenant admin consent is mandatory.** Both Cloud PC Graph scopes are delegated-and-admin-consent-only. The app is
   unusable in a tenant until an admin approves. Personal Microsoft accounts are not supported at all.
 - **Tenants enforcing device-based Conditional Access are not supported** until broker integration lands. An

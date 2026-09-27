@@ -152,11 +152,11 @@ def test_unknown_status_fails_closed_on_both_methods_with_reason():
 
 def test_connectable_status_defers_to_launcher_availability():
     methods = connect_methods(cloudpc_connect_gate("provisioned"))
-    # Status permits connection, but this build ships no launchers -- both disabled with the
-    # build reason, not the status reason.
-    assert not methods[ConnectMethod.WEB].enabled
-    assert "build" in methods[ConnectMethod.WEB].reason
+    # Status permits connection: web is live (add-web-launcher, applied); native still awaits
+    # its own change and stays disabled with the build reason, not the status reason.
+    assert methods[ConnectMethod.WEB].enabled
     assert not methods[ConnectMethod.NATIVE].enabled
+    assert "build" in methods[ConnectMethod.NATIVE].reason
 
 
 def test_avd_native_override_carries_the_phase0_reason():
@@ -165,7 +165,21 @@ def test_avd_native_override_carries_the_phase0_reason():
     )
     methods = groups[0].rows[0].methods
     assert methods[ConnectMethod.NATIVE].reason == NATIVE_DISABLED_REASON
-    assert ConnectMethod.WEB in methods  # both always present
+    assert methods[ConnectMethod.WEB].enabled  # both present; web is launchable now
+
+
+def test_avd_entry_without_ids_disables_web_with_the_stated_reason():
+    """The web-launch spec's FR-2-AC-1 scenario: no admin-provisioned IDs -> web disabled --
+    never hidden -- with the exact stated reason, and no URL composed for it."""
+    from winonlinux.ui_models import AVD_IDS_UNKNOWN_REASON
+
+    groups = build_groups(
+        [], [AvdBookmark(workspace_id="", resource_id="r", display_name="D", kind="desktop")]
+    )
+    methods = groups[0].rows[0].methods
+    assert set(methods) == {ConnectMethod.NATIVE, ConnectMethod.WEB}
+    assert not methods[ConnectMethod.WEB].enabled
+    assert methods[ConnectMethod.WEB].reason == AVD_IDS_UNKNOWN_REASON
 
 
 def test_disabled_availability_without_reason_is_a_construction_error():

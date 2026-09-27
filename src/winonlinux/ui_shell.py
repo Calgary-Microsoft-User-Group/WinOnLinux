@@ -33,6 +33,7 @@ from winonlinux.auth_cache import KeyringUnavailable  # noqa: E402
 from winonlinux.auth_manager import SignInCancelled  # noqa: E402
 from winonlinux.cloudpc_provider import Enumerated  # noqa: E402
 from winonlinux.task_registry import run_blocking  # noqa: E402
+from winonlinux.web_launcher import BrowserSpawnFailed  # noqa: E402
 from winonlinux.ui_models import ConnectMethod, UiState  # noqa: E402
 
 __all__ = ["MainWindow"]
@@ -89,10 +90,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._task_registry = application.task_registry
         self._method_prefs = application.method_prefs
 
+        self._web_launcher = application.web_launcher
         self._bookmarks: list = []
         self._latest_by_account: dict[str, object] = {}
         self._refresh_in_flight = False
         self._pending = ui_models.PendingTransitions()
+        # Resource keys with a launch in flight -- drives the §4.2 per-entry spinner until the
+        # browser is spawned (or the native session window appears, once native exists).
+        self._launching_keys: set[str] = set()
 
         self._build_widgets()
 
@@ -285,23 +290,111 @@ class MainWindow(Adw.ApplicationWindow):
         )
         self._account_popover.popdown()
 
-    def _launch(self, resource_key: str, method: ConnectMethod) -> None:
-        """Dispatch a connect. Reachable only through an enabled method entry -- and no launcher
-        change is applied in this build, so today every path here is fail-safe plumbing for
-        add-web-launcher / add-native-launcher to complete (§4.2 spinner + FR-2-AC-5 fallback
-        surface land with the launch calls themselves)."""
+    def _launch(self, resource_key: str, method: ConnectMethod, *, kind: str) -> None:
+        """Dispatch a connect. Reachable only through an enabled method entry: web dispatches
+        through the web launcher (add-web-launcher); native has no launcher in this build, so
+        an arrival here is fail-safe plumbing that presents the FR-2-AC-5 fallback surface."""
         account_id = self._auth.active_account_id
         if account_id is None:
             return
-        self._method_prefs.record_use(account_id, resource_key, method)  # FR-2-AC-2
-        self._present_launch_failure(
-            resource_key,
-            f"{_METHOD_LABELS[method]} is not available in this build yet",
-            offer_web_fallback=method is ConnectMethod.NATIVE,
+
+        if method is ConnectMethod.NATIVE:
+            self._method_prefs.record_use(account_id, resource_key, method)  # FR-2-AC-2
+            self._present_launch_failure(
+                resource_key,
+                f"{_METHOD_LABELS[method]} is not available in this build yet",
+                offer_web_fallback=True,
+                kind=kind,
+            )
+            return
+
+        bookmark = self._bookmark_for(resource_key) if kind != "cloudpc" else None
+        if bookmark is not None and self._web_launcher.needs_second_remoteapp_warning(bookmark):
+            # §12 risk 9: a second RemoteApp web tab from the same host pool disconnects the
+            # first -- warn, and launch only on explicit confirmation.
+            self._confirm_second_remoteapp(resource_key, kind)
+            return
+
+        self._start_web_launch(resource_key, kind)
+
+    def _bookmark_for(self, resource_key: str):
+        for bookmark in self._bookmarks:
+            if ui_models.avd_resource_key(bookmark) == resource_key:
+                return bookmark
+        return None
+
+    def _confirm_second_remoteapp(self, resource_key: str, kind: str) -> None:
+        dialog = Adw.AlertDialog(
+            heading="Disconnect the other RemoteApp?",
+            body=(
+                "Opening another RemoteApp from this workspace disconnects the RemoteApp "
+                "session already running in your browser."
+            ),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("launch", "Open anyway")
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def on_response(_dialog, response: str) -> None:
+            if response == "launch":
+                self._start_web_launch(resource_key, kind)
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    def _start_web_launch(self, resource_key: str, kind: str) -> None:
+        """Resolve the launch URL and hand it to the browser, with the §4.2 spinner shown on
+        the entry until the spawn completes and the §9 copyable-URL toast on spawn failure."""
+        account_id = self._auth.active_account_id
+        if account_id is None:
+            return
+        self._method_prefs.record_use(account_id, resource_key, ConnectMethod.WEB)  # FR-2-AC-2
+        self._launching_keys.add(resource_key)
+        self._render()
+
+        async def launch() -> None:
+            try:
+                if kind == "cloudpc":
+                    url = await self._web_launcher.resolve_cloudpc_url(resource_key, account_id)
+                else:
+                    bookmark = self._bookmark_for(resource_key)
+                    if bookmark is None:
+                        self._toast("This resource is no longer available. Refresh and retry.")
+                        return
+                    url = self._web_launcher.resolve_avd_url(bookmark, account_id)
+                await self._web_launcher.open_in_browser(url)
+                if kind == "remoteapp":
+                    bookmark = self._bookmark_for(resource_key)
+                    if bookmark is not None:
+                        self._web_launcher.note_remoteapp_launch(bookmark)
+            except BrowserSpawnFailed as exc:
+                self._present_spawn_failure(exc)
+            except Exception as exc:  # noqa: BLE001 - typed AuthErrors carry user_message
+                self._toast(getattr(exc, "user_message", "The connection could not be started."))
+                logger.warning("ui_shell: web launch failed", exc_info=True)
+            finally:
+                self._launching_keys.discard(resource_key)
+                self._render()
+
+        self._task_registry.get_or_create_group(account_id).create_task(
+            launch(), name="ui-web-launch"
         )
 
+    def _present_spawn_failure(self, failure: BrowserSpawnFailed) -> None:
+        """§9: browser fails to spawn -> error toast offering the URL for manual copy."""
+        toast = Adw.Toast(title=failure.user_message)
+        toast.set_button_label("Copy link")
+        toast.set_timeout(0)  # sticks around until dismissed; the user needs time to copy
+
+        def copy(*_args) -> None:
+            self.get_clipboard().set(failure.url)
+
+        toast.connect("button-clicked", copy)
+        self._toast_overlay.add_toast(toast)
+
     def _present_launch_failure(
-        self, resource_key: str, reason: str, *, offer_web_fallback: bool
+        self, resource_key: str, reason: str, *, offer_web_fallback: bool, kind: str
     ) -> None:
         """FR-2-AC-5's shared failure surface: the reason plus, for a native failure, a
         one-action web fallback on the same surface."""
@@ -310,7 +403,7 @@ class MainWindow(Adw.ApplicationWindow):
             toast.set_button_label("Connect (Web)")
             toast.connect(
                 "button-clicked",
-                lambda *_: self._launch(resource_key, ConnectMethod.WEB),
+                lambda *_: self._start_web_launch(resource_key, kind),
             )
         self._toast_overlay.add_toast(toast)
 
@@ -487,6 +580,9 @@ class MainWindow(Adw.ApplicationWindow):
     def _build_row(self, row: ui_models.ResourceRow, account_id, *, greyed: bool) -> Gtk.Widget:
         action_row = Adw.ActionRow(title=row.title, subtitle=row.type_label)
 
+        if row.key in self._launching_keys:
+            action_row.add_suffix(Gtk.Spinner(spinning=True, valign=Gtk.Align.CENTER))
+
         if row.status:
             chip = Gtk.Label(label=row.status, valign=Gtk.Align.CENTER)
             chip.add_css_class("caption")
@@ -520,7 +616,7 @@ class MainWindow(Adw.ApplicationWindow):
         primary.set_sensitive(primary_availability.enabled)
         if primary_availability.reason:
             primary.set_tooltip_text(primary_availability.reason)
-        primary.connect("clicked", lambda *_: self._launch(row.key, preferred))
+        primary.connect("clicked", lambda *_: self._launch(row.key, preferred, kind=row.kind))
 
         menu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         popover = Gtk.Popover()
@@ -533,7 +629,7 @@ class MainWindow(Adw.ApplicationWindow):
                 entry.set_tooltip_text(availability.reason)
             entry.connect(
                 "clicked",
-                lambda _b, m=method: (popover.popdown(), self._launch(row.key, m)),
+                lambda _b, m=method: (popover.popdown(), self._launch(row.key, m, kind=row.kind)),
             )
             menu_box.append(entry)
         popover.set_child(menu_box)
