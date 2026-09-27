@@ -38,17 +38,22 @@ GLib-native asyncio policy (e.g. a maintained ``gbulb`` successor) becomes prefe
 this file needs to change -- every other module talks to asyncio via the standard ``asyncio.*``
 API and never imports GLib for scheduling.
 
-This is the one module in the app-foundation change that imports ``gi``/GLib; it cannot be
-exercised in an environment without PyGObject installed (see the design.md non-goal on UI content
-and the task instructions for this change: no automated test targets this file, only
-``tests/manual/app_uniqueness.md`` documents the manual verification the running application
-needs).
+This is the one module in the app-foundation change that imports ``gi``/GLib. The GLib-pump half
+cannot be exercised without PyGObject (``tests/manual/app_uniqueness.md`` documents that manual
+verification); the pure-asyncio halves added by fix-shutdown-loop-hygiene -- ``shutdown()``'s
+settle/executor-join sequence and the loop exception handler -- ARE covered by automated tests
+(``tests/test_asyncio_bridge.py``) under a minimal ``gi`` stub.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import concurrent.futures.thread
 import logging
+import threading
+import time
+import weakref
 
 import gi
 
@@ -58,6 +63,7 @@ from gi.repository import GLib  # noqa: E402  (require_version must precede this
 __all__ = [
     "install",
     "uninstall",
+    "shutdown",
     "get_loop",
     "is_installed",
 ]
@@ -76,8 +82,83 @@ _PRIORITY = GLib.PRIORITY_DEFAULT
 #: short enough to be imperceptible as UI latency, long enough not to burn CPU rescheduling itself.
 _PUMP_HEARTBEAT_SECONDS = 0.02
 
+#: Overall bound on :func:`shutdown`: cancelled tasks get this long to run their cleanup, and the
+#: executor gets whatever remains of it to join -- generous for `finally` blocks that only close
+#: sockets/files, small enough that quitting never feels hung (fix-shutdown-loop-hygiene, F-06).
+_SHUTDOWN_DEADLINE_SECONDS = 2.0
+
+#: Per-iteration timer scheduled while settling so `_run_once()` never blocks the settle loop for
+#: longer than this between checks.
+_SETTLE_TICK_SECONDS = 0.01
+
 _loop: asyncio.AbstractEventLoop | None = None
 _idle_source_id: int | None = None
+_executor: "concurrent.futures.ThreadPoolExecutor | None" = None
+
+
+class _DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
+    """A ``ThreadPoolExecutor`` whose workers are daemon threads that the interpreter neither
+    joins at exit nor waits for.
+
+    This is the loop's default executor (every ``run_blocking`` call lands here). Stock
+    ``ThreadPoolExecutor`` workers are non-daemon since CPython 3.9, and ``threading._shutdown``
+    joins every non-daemon thread at interpreter exit -- so one in-flight blocking call (e.g. a
+    ``requests.get`` mid-timeout) holds the whole process open after the user quits, which is
+    exactly audit finding F-06's exit-lag half. Daemon workers make "abandon with a WARNING"
+    (this change's spec) real instead of aspirational.
+
+    ASSUMED-stable internals, same posture as this module's ``_run_once()`` use: the override
+    below copies ``ThreadPoolExecutor._adjust_thread_count`` (stable across CPython 3.9-3.13)
+    with two deliberate differences -- ``daemon=True``, and no ``_threads_queues`` registration
+    (that registry exists so ``concurrent.futures``' atexit hook can join workers; daemon workers
+    must be exempt from exactly that join). Verified continuously once add-audit-test-coverage's
+    CI version matrix lands (BIG-342).
+    """
+
+    def _adjust_thread_count(self) -> None:
+        # Copied from CPython's concurrent/futures/thread.py (see class docstring).
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):  # pragma: no cover - GC-timing dependent
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = f"{self._thread_name_prefix or self}_{num_threads}"
+            t = threading.Thread(
+                name=thread_name,
+                target=concurrent.futures.thread._worker,  # noqa: SLF001 - see class docstring
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,
+            )
+            t.start()
+            self._threads.add(t)
+
+
+def _loop_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Route unhandled task/callback exceptions through the app's (redacted) logging.
+
+    Installed on the loop by :func:`install` (fix-shutdown-loop-hygiene, audit F-24) so nothing
+    falls to asyncio's default stderr handler at GC time, outside §10.7's record-factory
+    discipline. Log-and-continue, never terminate: a background task dying must not take the
+    application down -- user-facing surfacing of failures travels through the state/result
+    listeners, not through this handler.
+    """
+    exception = context.get("exception")
+    source = context.get("task") or context.get("future") or context.get("handle")
+    source_name = getattr(source, "get_name", lambda: None)() or repr(source)
+    logger.error(
+        "asyncio_bridge: unhandled exception in asyncio (%s; source=%s) -- logged and continuing",
+        context.get("message") or "no message supplied",
+        source_name,
+        exc_info=exception,
+    )
 
 
 def _reschedule_heartbeat(loop: asyncio.AbstractEventLoop) -> None:
@@ -105,6 +186,15 @@ def install() -> asyncio.AbstractEventLoop:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     _reschedule_heartbeat(loop)
+
+    # Unhandled task exceptions land in redacted logs, not stderr-at-GC-time (F-24).
+    loop.set_exception_handler(_loop_exception_handler)
+
+    # The bridge owns the default executor so shutdown() can tear it down within a bound and a
+    # stuck worker cannot hold interpreter exit -- see _DaemonThreadPoolExecutor (F-06).
+    global _executor
+    _executor = _DaemonThreadPoolExecutor(thread_name_prefix="winonlinux-blocking")
+    loop.set_default_executor(_executor)
 
     # asyncio.get_running_loop() -- which run_blocking(), asyncio.ensure_future(), and virtually
     # all real asyncio code depends on -- only succeeds while a loop is marked "running" via
@@ -139,12 +229,21 @@ def install() -> asyncio.AbstractEventLoop:
 
 
 def uninstall() -> None:
-    """Stop pumping and close the installed loop. Safe to call when not installed (no-op)."""
-    global _loop, _idle_source_id
+    """Stop pumping and close the installed loop. Safe to call when not installed (no-op).
+
+    Bare teardown only: pending tasks are NOT settled and the executor is NOT drained here --
+    :func:`shutdown` is the orderly variant application exit uses (F-06); this remains for
+    callers that need an immediate, unconditional teardown.
+    """
+    global _loop, _idle_source_id, _executor
 
     if _idle_source_id is not None:
         GLib.source_remove(_idle_source_id)
         _idle_source_id = None
+
+    if _executor is not None:
+        _executor.shutdown(wait=False, cancel_futures=True)
+        _executor = None
 
     if _loop is not None:
         asyncio.events._set_running_loop(None)  # noqa: SLF001 -- undo the install()-time set
@@ -152,6 +251,86 @@ def uninstall() -> None:
             _loop.close()
         _loop = None
         logger.debug("asyncio_bridge: uninstalled the asyncio loop")
+
+
+def shutdown(deadline_seconds: float = _SHUTDOWN_DEADLINE_SECONDS) -> None:
+    """Orderly teardown, bounded by ``deadline_seconds`` overall (F-06).
+
+    Sequence: pump the loop until every pending task has settled (delivering the
+    ``CancelledError`` the caller's ``destroy_group`` calls already requested, so ``finally``
+    blocks actually run) or the deadline elapses -- logging any task still pending by name --
+    then join the executor within whatever remains of the deadline, abandoning (and naming) any
+    still-running daemon worker, then :func:`uninstall`. Safe to call when not installed.
+    """
+    started = time.monotonic()
+
+    if _loop is not None and not _loop.is_closed():
+        leftover = _settle_pending_tasks(_loop, deadline_seconds)
+        for task in leftover:
+            logger.warning(
+                "asyncio_bridge: task %r still pending at the %.1fs shutdown deadline; closing "
+                "the loop without its cleanup having run",
+                task.get_name(),
+                deadline_seconds,
+            )
+
+    remaining = max(0.0, deadline_seconds - (time.monotonic() - started))
+    _join_executor_bounded(remaining)
+
+    uninstall()
+
+
+def _settle_pending_tasks(
+    loop: asyncio.AbstractEventLoop, deadline_seconds: float
+) -> "list[asyncio.Task]":
+    """Pump ``loop`` until it has no pending tasks or the deadline passes; return the leftovers.
+
+    Each iteration schedules a short no-op timer first so ``_run_once()``'s internal ``select()``
+    timeout is bounded by :data:`_SETTLE_TICK_SECONDS` even when the GLib-side pump (and its
+    heartbeat's rescheduling) is no longer running.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    while True:
+        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+        if not pending:
+            return []
+        if time.monotonic() >= deadline:
+            return pending
+        loop.call_later(_SETTLE_TICK_SECONDS, _noop)
+        loop._run_once()  # noqa: SLF001 -- same private-but-stable use as _pump(), see install()
+
+
+def _noop() -> None:
+    pass
+
+
+def _join_executor_bounded(deadline_seconds: float) -> None:
+    """Join the bridge-owned executor within ``deadline_seconds``; abandon-with-WARNING after.
+
+    The join itself runs on a helper daemon thread so a stuck worker (e.g. a blocking HTTP call
+    mid-timeout) bounds this function at the deadline instead of the worker's own duration; an
+    abandoned worker is a daemon thread (see :class:`_DaemonThreadPoolExecutor`) and therefore
+    cannot hold interpreter exit either.
+    """
+    global _executor
+    executor = _executor
+    _executor = None
+    if executor is None:
+        return
+
+    executor.shutdown(wait=False, cancel_futures=True)
+    joiner = threading.Thread(
+        target=executor.shutdown, kwargs={"wait": True}, daemon=True, name="winonlinux-exec-join"
+    )
+    joiner.start()
+    joiner.join(deadline_seconds)
+    if joiner.is_alive():
+        alive = [t.name for t in getattr(executor, "_threads", ()) if t.is_alive()]
+        logger.warning(
+            "asyncio_bridge: abandoning executor worker(s) still running at shutdown "
+            "(daemon threads; they cannot hold process exit): %s",
+            ", ".join(alive) or "<unknown>",
+        )
 
 
 def get_loop() -> asyncio.AbstractEventLoop:

@@ -185,5 +185,30 @@ def test_cache_write_serializer_releases_lock_on_exception():
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_module_level_cache_write_serializer_singleton_is_shared():
-    assert isinstance(auth_cache.cache_write_serializer, CacheWriteSerializer)
+def test_no_module_level_serializer_singleton_exists():
+    """The import-time singleton is deliberately GONE (fix-shutdown-loop-hygiene, audit F-09):
+    an asyncio.Lock created at import binds to the first event loop that contends it and raises
+    from any other loop. AuthManager owns one serializer per instance instead -- pinned in
+    tests/test_auth_manager.py."""
+    assert not hasattr(auth_cache, "cache_write_serializer")
+
+
+def test_serializer_instances_are_loop_affine_not_cross_loop():
+    """Two serializer instances used (contended) in two different event loops must not
+    interfere -- the exact failure shape the 2026-09-22 audit reproduced on Python 3.12 with
+    the old shared singleton."""
+
+    def contend(serializer: CacheWriteSerializer) -> None:
+        async def one_holder():
+            async with serializer:
+                await asyncio.sleep(0.001)
+
+        async def scenario():
+            await asyncio.gather(one_holder(), one_holder())  # forces lock contention
+
+        asyncio.run(scenario())
+
+    # Each loop gets its own instance (as each AuthManager now constructs its own): no
+    # cross-loop RuntimeError, unlike a shared instance contended in two loops.
+    contend(CacheWriteSerializer())
+    contend(CacheWriteSerializer())

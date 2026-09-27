@@ -348,12 +348,17 @@ class WinOnLinuxApplication(Adw.Application):
             )
 
     def do_shutdown(self) -> None:
-        """Tear down the asyncio bridge cleanly when the application quits."""
+        """Tear down the asyncio bridge cleanly when the application quits.
+
+        Cancel first, then ``asyncio_bridge.shutdown()`` -- which pumps the loop (bounded) so
+        every cancelled task's ``except``/``finally`` cleanup actually runs before the loop
+        closes, and joins the executor within the same bound so a stuck blocking call cannot
+        delay exit (fix-shutdown-loop-hygiene, audit F-06).
+        """
         if self.task_registry is not None:
             for account_id in list(self.task_registry.active_account_ids()):
                 self.task_registry.destroy_group(account_id)
-        if asyncio_bridge.is_installed():
-            asyncio_bridge.uninstall()
+        asyncio_bridge.shutdown()
         Adw.Application.do_shutdown(self)
 
 

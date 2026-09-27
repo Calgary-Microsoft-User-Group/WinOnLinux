@@ -90,7 +90,6 @@ __all__ = [
     "detect_keyring_available",
     "build_persisted_cache",
     "CacheWriteSerializer",
-    "cache_write_serializer",
 ]
 
 logger = logging.getLogger(__name__)
@@ -226,20 +225,26 @@ def detect_keyring_available() -> bool:
 
 
 class CacheWriteSerializer:
-    """Async context manager around one process-wide :class:`asyncio.Lock`.
+    """Async context manager serializing every mutation of one token cache.
 
     ``msal_extensions.PersistedTokenCache`` persists the *whole* cache blob on any change,
     including a change that only touches one account's tokens. Two concurrent MSAL calls for
     *different* accounts (e.g. one account's silent refresh racing another account's interactive
-    sign-in) could otherwise race on that persist step and corrupt or drop the other's write. Every
-    caller wraps an MSAL call that can mutate the cache -- interactive acquisition, silent
-    acquisition, ``remove_account`` -- in ``async with cache_write_serializer:``.
+    sign-in) could otherwise race on that persist step and corrupt or drop the other's write.
+    Every caller wraps an MSAL call that can mutate the cache -- interactive acquisition, silent
+    acquisition, ``remove_account`` -- in ``async with`` on the serializer instance guarding that
+    cache.
 
-    Distinct from the per-*account* single-flight lock in ``auth_manager.py`` (a parallel task),
-    which prevents redundant concurrent refreshes for the *same* account; this lock is about safe
-    persistence across *different* accounts' concurrent operations and is process-wide by design,
-    hence the module-level singleton :data:`cache_write_serializer` below rather than one instance
-    per caller.
+    Distinct from the per-*account* single-flight lock in ``auth_manager.py``, which prevents
+    redundant concurrent refreshes for the *same* account; this lock is about safe persistence
+    across *different* accounts' concurrent operations. The scope is one lock **per token
+    cache** -- which is exactly one per ``AuthManager``, which is why ``AuthManager`` constructs
+    its own instance rather than this module exporting a singleton. (It used to be an import-time
+    module singleton; the 2026-09-22 audit's Python 3.12 suite run proved that an
+    ``asyncio.Lock`` created at import binds to the first event loop that *contends* it and
+    raises ``RuntimeError`` from any other loop -- fix-shutdown-loop-hygiene, audit F-09.
+    Production had exactly one loop, so the hazard was latent; per-manager ownership removes it
+    rather than relying on that unpinned assumption.)
     """
 
     def __init__(self) -> None:
@@ -251,7 +256,3 @@ class CacheWriteSerializer:
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
         self._lock.release()
-
-
-#: The one process-wide instance callers actually use: ``async with cache_write_serializer:``.
-cache_write_serializer = CacheWriteSerializer()

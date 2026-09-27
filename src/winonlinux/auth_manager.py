@@ -63,7 +63,7 @@ import msal
 import requests
 
 from winonlinux import auth_errors
-from winonlinux.auth_cache import build_persisted_cache, cache_write_serializer
+from winonlinux.auth_cache import CacheWriteSerializer, build_persisted_cache
 from winonlinux.auth_errors import ClassifiedMsalError, MsalErrorCategory
 from winonlinux.auth_loopback import LoopbackListener, LoopbackTimeout
 from winonlinux.auth_state import AccountAuthState, AuthState
@@ -303,6 +303,12 @@ class AuthManager:
         self._client_id = client_id if client_id is not None else _CLIENT_ID_PLACEHOLDER
 
         self._app: msal.PublicClientApplication | None = None
+
+        # Serializes every cache-mutating MSAL call against this manager's token cache (see
+        # CacheWriteSerializer's docstring). Owned per-manager -- created here, dying with the
+        # manager -- so its asyncio.Lock can never bind to an event loop other than the one this
+        # manager runs on (fix-shutdown-loop-hygiene, audit F-09).
+        self._cache_write_serializer = CacheWriteSerializer()
 
         # Public: read directly by callers (no property wrapper -- see task description).
         self.accounts: dict[str, AccountAuthState] = {}
@@ -545,7 +551,7 @@ class AuthManager:
         self._require_started()
         msal_account = await self._find_msal_account(home_account_id)
         if msal_account is not None:
-            async with cache_write_serializer:
+            async with self._cache_write_serializer:
                 await run_blocking(self._app.remove_account, msal_account)
         else:
             logger.warning(
@@ -672,7 +678,7 @@ class AuthManager:
             raise ReauthRequiredError(home_account_id)
 
         try:
-            async with cache_write_serializer:
+            async with self._cache_write_serializer:
                 result = await run_blocking(
                     self._app.acquire_token_silent_with_error, scopes, account=msal_account
                 )
@@ -847,7 +853,7 @@ class AuthManager:
             )
             raise SignInCancelled(redirect_result.query_params.get("error", "unknown"))
 
-        async with cache_write_serializer:
+        async with self._cache_write_serializer:
             token_result = await run_blocking(
                 self._app.acquire_token_by_auth_code_flow, flow, redirect_result.query_params
             )

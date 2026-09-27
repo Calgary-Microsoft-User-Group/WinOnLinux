@@ -1063,3 +1063,36 @@ def test_every_auth_error_type_carries_a_clean_user_message():
     assert "AADSTS" not in err.user_message
     assert err.raw_error_description_for_logs == "AADSTS900000: something raw"
     assert not hasattr(err, "raw_error_description")
+
+
+# --- fix-shutdown-loop-hygiene (audit F-09): per-manager serializer loop affinity -----------------
+
+
+def test_two_managers_in_two_loops_contend_their_own_serializers_without_cross_loop_error():
+    """The audit's Python 3.12 reproducer, generalized: each AuthManager owns its serializer, so
+    running contended acquisitions in two managers across two fresh event loops raises no
+    'bound to a different event loop' RuntimeError (the old module singleton did)."""
+
+    def run_contended_acquisitions() -> None:
+        app = FakeMsalApp()
+        home_account_id = "acct-loop-affinity"
+        app.accounts[home_account_id] = {
+            "home_account_id": home_account_id, "username": "user@contoso.com"
+        }
+        app.silent_sleep_seconds = 0.02  # long enough that the serializer genuinely contends
+        app.silent_result_factory = lambda scopes, account: {"access_token": FAKE_ACCESS_TOKEN}
+        manager, _ = _make_manager(app)
+        _seeded_account(manager, home_account_id)
+
+        async def scenario():
+            # Different scopes bypass the single-flight dedup, so both callers reach the
+            # cache-write serializer concurrently and contend its lock.
+            await asyncio.gather(
+                manager.acquire_token_silently(home_account_id, ["Scope.A"]),
+                manager.acquire_token_silently(home_account_id, ["Scope.B"]),
+            )
+
+        asyncio.run(scenario())
+
+    run_contended_acquisitions()  # loop 1, manager 1
+    run_contended_acquisitions()  # loop 2, manager 2 -- must not see loop 1's lock
