@@ -5,21 +5,29 @@ Guidance for Claude Code working in this repository.
 ## What this repo is
 
 WinOnLinux — a Linux desktop client for Windows 365 Cloud PCs and Azure Virtual Desktop. The repo started as
-**specification-only** and is now transitioning into a **live coding repo**: `openspec/changes/` holds 10 OpenSpec
-change proposals (`add-app-foundation`, `add-auth-account-manager`, `add-avd-feed-provider`, `add-cloudpc-actions`,
-`add-cloudpc-enumeration`, `add-connection-config-provider`, `add-flatpak-packaging`, `add-native-launcher`,
-`add-ui-shell`, `add-web-launcher`), each with a `proposal.md`, `design.md`, `specs/` delta, and a `tasks.md` of real
-implementation tasks (Python/GTK4/FreeRDP code, tests, CI). As of 2026-09-14 none has been applied yet — no
-`src/` tree exists and there are still no build/test/lint commands to run — but do not assume "document work only":
-once a change is applied (see the `openspec-apply-change` skill), work in this repo includes writing and testing
-application code against that change's `tasks.md`, not just editing markdown. `spec.md` stays normative for
-requirements and decisions throughout; OpenSpec changes implement it, they don't replace it as the source of truth.
+**specification-only** and is now a **live coding repo**. As of 2026-09-27, **five of the ten OpenSpec changes are
+applied**: `add-app-foundation`, `add-auth-account-manager`, `add-cloudpc-enumeration`, `add-ui-shell`, and
+`add-web-launcher` (the last two complete except their live-tenant/desktop manual passes). The remaining five
+(`add-avd-feed-provider`, `add-cloudpc-actions`, `add-connection-config-provider`, `add-flatpak-packaging`,
+`add-native-launcher`) sit in `openspec/changes/`, the native-path ones gated on Stage 0/1 and LG-1. Six further
+changes from the 2026-09-22 code audit (`codeaudit/2026-09-22.md` — all 26 findings closed) are implemented and
+archived under `openspec/changes/archive/`. The app signs in, enumerates Cloud PCs, and launches web sessions
+end to end.
+
+Build/test commands now exist: `python -m pytest` runs the unit suite (~280 tests, `-m unit` is the default;
+hermetic, no display server). CI (`.github/workflows/ci.yml`) runs it on Python 3.11/3.12/3.13 with the pinned
+`constraints.txt` set (D-23) plus a report-only `pip-audit`. `spec.md` stays normative for requirements and
+decisions throughout; OpenSpec changes implement it, they don't replace it as the source of truth.
 
 ```
 spec.md                   The specification. §14 is the decision register — authoritative.
 gapsandrecommendations.md  Completeness/feasibility assessment: 54 findings (G-nn), applied + backlog.
 README.md                  Public-facing summary.
-openspec/changes/*/        OpenSpec change proposals decomposing spec.md into implementable units (see above).
+src/winonlinux/            The application (19 modules): auth, Graph, providers, view models, GTK shell.
+tests/                     Unit suite (~280 tests, pytest -m unit; gi stub in conftest for headless CI).
+constraints.txt            Pinned dependency set (D-23) — CI installs with it; Flatpak will consume it.
+codeaudit/2026-09-22.md    The code audit: 26 findings, controls matrix, assumed-facts register. All closed.
+openspec/changes/*/        Remaining OpenSpec change proposals (see above); archive/ holds completed ones.
 docs/superpowers/specs/2026-08-18-...-design.md
                            Original native-path design. Partly superseded by spec.md.
 ```
@@ -31,7 +39,7 @@ Execution is tracked in **Linear** — team `BigHatGroup` (workspace `linear.app
 | `WindowsAppforLinuxPrereq` | Tenant, licence, hardware, tooling procurement (E-1…E-11) | Spec or code work |
 | `WindowsAppForLinuxImpl` | Open specification and decision gaps (G-nn) | Procurement or execution |
 | `WindowsAppForLinuxSprint1` | The 5-day feasibility sprint (S-0…S-7, V3, LG-1) | Anything beyond the sprint |
-| `WinOnLinuxCode` | Application code, one issue per OpenSpec change under `openspec/changes/` (10/10 filed as of 2026-09-15); ordering enforced by Linear blocking relations, Phase 1 issues titled `(GATED: Stage 0/1, LG-1)` | Spec/decision gaps or procurement |
+| `WinOnLinuxCode` | Application code, one issue per OpenSpec change under `openspec/changes/` (10 original + 6 audit-remediation issues BIG-337…BIG-342, the latter all Done); ordering enforced by Linear blocking relations, Phase 1 issues titled `(GATED: Stage 0/1, LG-1)`. BIG-287/BIG-273 are In Progress pending manual desktop/tenant passes | Spec/decision gaps or procurement |
 
 Older references to "Prerequisites", "Implementation", and "Sprint 1" project names elsewhere (including earlier in this file's history) mean
 `WindowsAppforLinuxPrereq`, `WindowsAppForLinuxImpl`, and `WindowsAppForLinuxSprint1` respectively — those are the actual Linear project
@@ -55,11 +63,12 @@ names to use when searching, filtering, or linking issues.
 
 ## Working conventions
 
-**The decision register (`spec.md` §14) is normative.** Twenty decisions, D-1…D-20, each with rationale and a revisit
-trigger. Before proposing an architectural change, check whether it is already decided — and if you want to reverse
-one, cite its revisit trigger rather than re-arguing from scratch. Decided so far: subprocess FreeRDP (D-1), keyring
-required with no file fallback (D-2), Flatpak (D-3), no certificate pinning (D-4), in-session config caching (D-5),
-Python 3 + GTK4 (D-16), MSAL Python (D-17), asyncio (D-18), `xfreerdp` (D-20).
+**The decision register (`spec.md` §14) is normative.** Twenty-three decisions, D-1…D-23, each with rationale and a
+revisit trigger. Before proposing an architectural change, check whether it is already decided — and if you want to
+reverse one, cite its revisit trigger rather than re-arguing from scratch. Decided so far: subprocess FreeRDP (D-1),
+keyring required with no file fallback (D-2), Flatpak (D-3), no certificate pinning (D-4), in-session config caching
+(D-5), Python 3 + GTK4 (D-16), MSAL Python (D-17), asyncio (D-18), `xfreerdp` (D-20), the application ID (D-21), a
+single FreeRDP probe (D-22), and constraints-file dependency pinning (D-23).
 
 **Record decisions, don't just make them.** A new decision gets an ID, a one-line rationale, and a revisit trigger, in
 the §14 table. This is what makes reversal a deliberate act rather than drift.
