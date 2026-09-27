@@ -39,7 +39,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, Gtk  # noqa: E402  (require_version must precede this import)
+from gi.repository import Adw, Gio  # noqa: E402  (require_version must precede this import)
 
 from winonlinux import asyncio_bridge
 from winonlinux.auth_cache import KeyringUnavailable
@@ -49,6 +49,7 @@ from winonlinux.cloudpc_provider import CloudPcProvider
 from winonlinux.freerdp_probe import FreeRdpProbeResult
 from winonlinux.freerdp_probe import probe as probe_freerdp
 from winonlinux.logging_setup import configure_logging
+from winonlinux.method_prefs import MethodPreferenceStore
 from winonlinux.state_store import StateStore
 from winonlinux.task_registry import TaskRegistry
 
@@ -147,6 +148,11 @@ class WinOnLinuxApplication(Adw.Application):
         #: check confirms this process is primary.
         self.avd_bookmarks: BookmarkStore | None = None
 
+        #: Per-resource connect-method preference store (add-ui-shell change, FR-2-AC-2).
+        #: Constructed in ``_first_activate`` like every other stateful attribute; ``None``
+        #: until the single-instance check confirms this process is primary.
+        self.method_prefs: MethodPreferenceStore | None = None
+
         self.connect("activate", self._on_activate)
 
     # -- signal handlers -----------------------------------------------------
@@ -231,11 +237,17 @@ class WinOnLinuxApplication(Adw.Application):
             self._run_freerdp_probe(), name="freerdp-version-probe"
         )
 
-        self._window = Adw.ApplicationWindow(application=self)
-        self._window.set_title("WinOnLinux")
-        self._window.set_default_size(800, 600)
-        # Placeholder content only -- the UI-shell change replaces this with real content.
-        self._window.set_content(Gtk.Box())
+        # Per-resource connect-method preferences (add-ui-shell change, FR-2-AC-2, D-13).
+        # Construction alone does no I/O; MainWindow schedules the load off the loop thread.
+        self.method_prefs = MethodPreferenceStore()
+
+        # The real §4 window (add-ui-shell change): account switcher, banners, grouped resource
+        # list, all bound to the state/result listeners. Imported here rather than at module
+        # top so the second-process constructor-purity contract keeps its "nothing stateful
+        # before first activation" shape trivially auditable.
+        from winonlinux.ui_shell import MainWindow
+
+        self._window = MainWindow(application=self)
         # Cold-start timing (NFR-1) is logged in _on_activate, after present() -- see the comment
         # there for why it must not be sampled here, before the window is actually shown.
 

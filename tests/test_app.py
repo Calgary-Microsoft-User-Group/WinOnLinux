@@ -57,5 +57,6 @@ def test_constructor_builds_nothing_stateful_before_first_activate():
     assert app.auth_manager is None
     assert app.cloudpc_provider is None
     assert app.avd_bookmarks is None
+    assert app.method_prefs is None
     assert app.freerdp_probe_result is None
     assert app.auth_manager_start_error is None
