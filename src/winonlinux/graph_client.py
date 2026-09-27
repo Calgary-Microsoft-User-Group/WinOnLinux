@@ -68,6 +68,7 @@ __all__ = [
     "GraphNetworkError",
     "GraphThrottled",
     "graph_get_json",
+    "graph_post_json",
 ]
 
 logger = logging.getLogger(__name__)
@@ -238,6 +239,52 @@ async def graph_get_json(
     let alone attached (fix-graph-hardening, audit F-01). This is the single choke point every
     caller (including nextLink paging) funnels through, so the check lives here, not in callers.
     """
+    return await _request_json(
+        "GET",
+        url,
+        auth_manager=auth_manager,
+        home_account_id=home_account_id,
+        scopes=scopes,
+        max_retries=max_retries,
+    )
+
+
+async def graph_post_json(
+    url: str,
+    *,
+    auth_manager: Any,
+    home_account_id: str,
+    scopes: list[str],
+    json_body: dict | None = None,
+    max_retries: int = 5,
+) -> dict:
+    """POST to Microsoft Graph (add-cloudpc-actions change), same contract as
+    :func:`graph_get_json`: URL allowlist first, fresh token per attempt (FR-4-AC-1), identical
+    retry/classification behavior. Graph action endpoints answer ``204 No Content`` on success,
+    returned here as ``{}``. ``max_retries=0`` disables retry entirely -- the first ``429`` or
+    transient ``5xx`` surfaces immediately (the reprovision path's never-auto-retried rule,
+    FR-5-AC-2)."""
+    return await _request_json(
+        "POST",
+        url,
+        auth_manager=auth_manager,
+        home_account_id=home_account_id,
+        scopes=scopes,
+        json_body=json_body,
+        max_retries=max_retries,
+    )
+
+
+async def _request_json(
+    method: str,
+    url: str,
+    *,
+    auth_manager: Any,
+    home_account_id: str,
+    scopes: list[str],
+    json_body: dict | None = None,
+    max_retries: int = 5,
+) -> dict:
     _validate_graph_url(url)
 
     backoff_seconds: float | None = None
@@ -252,9 +299,18 @@ async def graph_get_json(
         headers = {"Authorization": f"Bearer {access_token}"}
 
         try:
-            response = await run_blocking(
-                requests.get, url, headers=headers, timeout=_REQUEST_TIMEOUT_SECONDS
-            )
+            if method == "POST":
+                response = await run_blocking(
+                    requests.post,
+                    url,
+                    headers=headers,
+                    timeout=_REQUEST_TIMEOUT_SECONDS,
+                    json=json_body,
+                )
+            else:
+                response = await run_blocking(
+                    requests.get, url, headers=headers, timeout=_REQUEST_TIMEOUT_SECONDS
+                )
         except requests.exceptions.ProxyError as exc:
             logger.warning(
                 "graph_get_json: proxy rejected request to %s (%s)", url, type(exc).__name__
@@ -274,7 +330,12 @@ async def graph_get_json(
 
         status = response.status_code
 
-        if status == 200:
+        if status == 204:
+            # Graph action endpoints answer 204 No Content on acceptance -- an empty dict is
+            # the "accepted, nothing to parse" shape callers dispatch on.
+            return {}
+
+        if status in (200, 201):
             try:
                 return response.json()
             except ValueError as exc:

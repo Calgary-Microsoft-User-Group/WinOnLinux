@@ -45,6 +45,7 @@ from winonlinux import asyncio_bridge
 from winonlinux.auth_cache import KeyringUnavailable
 from winonlinux.auth_manager import AuthManager
 from winonlinux.avd_bookmarks import BookmarkStore
+from winonlinux.cloudpc_actions import CloudPcActionService
 from winonlinux.cloudpc_provider import CloudPcProvider
 from winonlinux.freerdp_probe import FreeRdpProbeResult
 from winonlinux.freerdp_probe import probe as probe_freerdp
@@ -158,6 +159,11 @@ class WinOnLinuxApplication(Adw.Application):
         #: the §7.2 beta launch-detail fast path stays at its default (off).
         self.web_launcher: WebLauncher | None = None
 
+        #: Cloud PC Management Action service (add-cloudpc-actions change, FR-5). Same
+        #: construction discipline; the §7.2 beta-actions flag defaults ON (the FR-5 surface
+        #: ships in Phase 0; the flag exists to turn the beta dependency off in one place).
+        self.cloudpc_actions: CloudPcActionService | None = None
+
         self.connect("activate", self._on_activate)
 
     # -- signal handlers -----------------------------------------------------
@@ -249,6 +255,14 @@ class WinOnLinuxApplication(Adw.Application):
         # Web launcher (add-web-launcher change): URL composition + browser handoff. The beta
         # launch-detail fast path defaults off (§7.2); construction alone does no I/O.
         self.web_launcher = WebLauncher(auth_manager=self.auth_manager)
+
+        # Management Action service (add-cloudpc-actions change, FR-5): invocation, gating,
+        # and beta containment. Construction alone does no I/O.
+        self.cloudpc_actions = CloudPcActionService(
+            auth_manager=self.auth_manager,
+            cloudpc_provider=self.cloudpc_provider,
+            task_registry=self.task_registry,
+        )
 
         # The real §4 window (add-ui-shell change): account switcher, banners, grouped resource
         # list, all bound to the state/result listeners. Imported here rather than at module

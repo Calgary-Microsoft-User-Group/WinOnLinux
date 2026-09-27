@@ -191,26 +191,26 @@ def test_pending_transition_suppresses_actions_until_refresh_clears():
     pending = PendingTransitions()
     pending.mark("cpc-1", "restart")
 
-    suppressed = cloudpc_actions("cpc-1", pending=pending)
+    suppressed = cloudpc_actions("cpc-1", status="provisioned", pending=pending)
     assert all(not availability.enabled for availability in suppressed.values())
     assert any("restart" in a.reason for a in suppressed.values())
 
-    other = cloudpc_actions("cpc-2", pending=pending)
+    other = cloudpc_actions("cpc-2", status="provisioned", pending=pending)
     assert all("restart" not in (a.reason or "") for a in other.values())  # scoped per resource
 
     pending.clear_on_refresh()
-    cleared = cloudpc_actions("cpc-1", pending=pending)
+    cleared = cloudpc_actions("cpc-1", status="provisioned", pending=pending)
     # Still disabled in this build (actions service unapplied) but no longer for the pending
     # reason -- the suppression itself lifted with the refresh.
     assert all("restart" not in (a.reason or "") for a in cleared.values())
 
 
 def test_admin_actions_absent_unless_capability_affirmed():
-    plain = cloudpc_actions("cpc-1")  # capability unknown -> not capable (FR-5-AC-3)
+    plain = cloudpc_actions("cpc-1", status="provisioned")  # capability unknown -> not capable
     assert set(plain) == {"restart", "rename", "troubleshoot", "reprovision"}
     assert "restore" not in plain and "resize" not in plain
 
-    admin = cloudpc_actions("cpc-1", admin_capable=True)
+    admin = cloudpc_actions("cpc-1", status="provisioned", admin_capable=True)
     assert {"restore", "resize"} <= set(admin)
 
 
@@ -239,3 +239,47 @@ def test_reauth_banner_wording_matches_spec():
     text = reauth_banner_text("user@contoso.com", "acct-a")
     assert text == "Your sign-in for user@contoso.com has expired. Sign in again."
     assert reauth_banner_text(None, "acct-a") == "Your sign-in for acct-a has expired. Sign in again."
+
+
+def test_pending_clear_per_key_lifts_only_that_resource():
+    """The D-8 bounded-timeout path (add-cloudpc-actions): clearing one resource's suppression
+    leaves another's intact."""
+    pending = PendingTransitions()
+    pending.mark("cpc-1", "restart")
+    pending.mark("cpc-2", "reprovision")
+
+    pending.clear("cpc-1")
+
+    assert pending.pending_action("cpc-1") is None
+    assert pending.pending_action("cpc-2") == "reprovision"
+
+
+def test_service_gate_flows_through_to_action_availability():
+    """cloudpc_actions consumes the real per-action gate (CloudPcActionService.action_gate
+    wrapped into Availability): enabled actions enable, contract-disabled ones carry the
+    service's reason, and pending suppression still wins over an enabled gate."""
+
+    def gate(action):
+        if action == "restart":
+            return Availability(False, "Action unavailable — Microsoft API change")
+        return Availability(True)
+
+    available = cloudpc_actions("cpc-1", status="provisioned", service_gate=gate)
+    assert available["rename"].enabled
+    assert not available["restart"].enabled
+    assert "API change" in available["restart"].reason
+
+    pending = PendingTransitions()
+    pending.mark("cpc-1", "troubleshoot")
+    suppressed = cloudpc_actions("cpc-1", status="provisioned", pending=pending, service_gate=gate)
+    assert not suppressed["rename"].enabled  # suppression wins over the enabled gate
+
+
+def test_unknown_status_disables_actions_too():
+    """§7.4's interim rule applies to ACTIONS as well as connects (add-cloudpc-actions,
+    tasks 3.2): an unrecognized status disables every action with a reason naming it."""
+    available = cloudpc_actions(
+        "cpc-1", status="someFutureStatus", service_gate=lambda a: Availability(True)
+    )
+    assert available and all(not a.enabled for a in available.values())
+    assert all("someFutureStatus" in a.reason for a in available.values())

@@ -20,6 +20,7 @@ methods are disabled, so the reasons remain discoverable.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import gi
@@ -31,6 +32,12 @@ from gi.repository import Adw, Gtk  # noqa: E402  (require_version must precede 
 from winonlinux import ui_models  # noqa: E402
 from winonlinux.auth_cache import KeyringUnavailable  # noqa: E402
 from winonlinux.auth_manager import SignInCancelled  # noqa: E402
+from winonlinux.cloudpc_actions import (  # noqa: E402
+    POST_ACTION_REFRESH_TIMEOUT_SECONDS,
+    Accepted,
+    ConsentRequired as ActionConsentRequired,
+    ContractError,
+)
 from winonlinux.cloudpc_provider import Enumerated  # noqa: E402
 from winonlinux.task_registry import run_blocking  # noqa: E402
 from winonlinux.web_launcher import BrowserSpawnFailed  # noqa: E402
@@ -91,6 +98,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._method_prefs = application.method_prefs
 
         self._web_launcher = application.web_launcher
+        self._actions = application.cloudpc_actions
         self._bookmarks: list = []
         self._latest_by_account: dict[str, object] = {}
         self._refresh_in_flight = False
@@ -98,6 +106,9 @@ class MainWindow(Adw.ApplicationWindow):
         # Resource keys with a launch in flight -- drives the §4.2 per-entry spinner until the
         # browser is spawned (or the native session window appears, once native exists).
         self._launching_keys: set[str] = set()
+        # D-7 admin capability per account, evaluated asynchronously on account activation;
+        # absent (= unknown) renders not capable (FR-5-AC-3).
+        self._admin_capable: dict[str, bool] = {}
 
         self._build_widgets()
 
@@ -196,7 +207,22 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_active_account_changed(self, home_account_id: str) -> None:
         self._refresh_in_flight = True
+        self._schedule_capability_evaluation(home_account_id)
         self._render()
+
+    def _schedule_capability_evaluation(self, home_account_id: str) -> None:
+        """D-7: evaluate admin capability off the render path; re-render when known so
+        Restore/Resize appear for admin-capable accounts (FR-5-AC-3)."""
+
+        async def evaluate() -> None:
+            capable = await self._actions.evaluate_admin_capability(home_account_id)
+            if self._admin_capable.get(home_account_id) != capable:
+                self._admin_capable[home_account_id] = capable
+                self._render()
+
+        self._task_registry.get_or_create_group(home_account_id).create_task(
+            evaluate(), name="ui-admin-capability"
+        )
 
     def _on_result(self, home_account_id: str, result) -> None:
         self._latest_by_account[home_account_id] = result
@@ -408,13 +434,33 @@ class MainWindow(Adw.ApplicationWindow):
         self._toast_overlay.add_toast(toast)
 
     def _invoke_action(self, resource_key: str, action: str) -> None:
-        """Dispatch a Cloud PC action. Reachable only through an enabled action entry, so today
-        (actions service unapplied) this is plumbing for add-cloudpc-actions; the §7.4 pending
-        suppression and FR-5-AC-1 toast behavior are already real."""
+        """Route a Cloud PC action (reachable only through an enabled entry, §7.4): rename
+        prompts for the new name, reprovision goes through its FR-5-AC-2 confirmation gate,
+        everything else dispatches directly."""
         if action == "reprovision":
             self._confirm_reprovision(resource_key)
             return
-        self._dispatch_action(resource_key, action)
+        if action == "rename":
+            self._prompt_rename(resource_key)
+            return
+        self._run_action(resource_key, action)
+
+    def _prompt_rename(self, resource_key: str) -> None:
+        dialog = Adw.AlertDialog(heading="Rename Cloud PC", body="Enter the new display name.")
+        entry = Gtk.Entry(activates_default=True)
+        dialog.set_extra_child(entry)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("rename", "Rename")
+        dialog.set_default_response("rename")
+        dialog.set_close_response("cancel")
+
+        def on_response(_dialog, response: str) -> None:
+            new_name = entry.get_text().strip()
+            if response == "rename" and new_name:
+                self._run_action(resource_key, "rename", payload={"displayName": new_name})
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
 
     def _confirm_reprovision(self, resource_key: str) -> None:
         """FR-5-AC-2: explicit checked confirmation; cancel dispatches nothing."""
@@ -440,18 +486,114 @@ class MainWindow(Adw.ApplicationWindow):
 
         def on_response(_dialog, response: str) -> None:
             if response == "reprovision":
-                self._dispatch_action(resource_key, "reprovision")
-            # Anything else -- cancel, close, Esc -- dispatches nothing (FR-5-AC-2).
+                self._run_action(resource_key, "reprovision", confirmed=True)
+            # Anything else -- cancel, close, Esc -- dispatches nothing (FR-5-AC-2): the
+            # service call below is never reached, so no network I/O ever happens.
 
         dialog.connect("response", on_response)
         dialog.present(self)
 
-    def _dispatch_action(self, resource_key: str, action: str) -> None:
+    def _run_action(
+        self,
+        resource_key: str,
+        action: str,
+        *,
+        payload: dict | None = None,
+        confirmed: bool = False,
+    ) -> None:
+        """Dispatch through the Management Action service (add-cloudpc-actions) and surface the
+        closed outcome family per §9: progress via pending suppression + toast, completion via
+        the immediate refresh the service schedules (D-8, FR-5-AC-1)."""
+        account_id = self._auth.active_account_id
+        if account_id is None:
+            return
+
         self._pending.mark(resource_key, action)  # §7.4 conflict suppression until refresh
-        self._toast(f"{_ACTION_LABELS.get(action, action)} requested")
         self._render()
-        # The actual Graph action call is add-cloudpc-actions work; on landing it schedules the
-        # call here and drives the FR-5-AC-1 post-action refresh via refresh_after_action.
+
+        async def run() -> None:
+            try:
+                if action == "reprovision":
+                    outcome = await self._actions.invoke_reprovision(
+                        account_id, resource_key, confirmed=confirmed
+                    )
+                else:
+                    outcome = await self._actions.invoke_action(
+                        account_id, resource_key, action, payload=payload
+                    )
+            except Exception as exc:  # noqa: BLE001 - typed AuthErrors carry user_message
+                self._pending.clear(resource_key)
+                self._toast(getattr(exc, "user_message", "The action could not be completed."))
+                logger.warning("ui_shell: %s failed", action, exc_info=True)
+                self._render()
+                return
+            self._handle_action_outcome(resource_key, action, outcome)
+
+        self._task_registry.get_or_create_group(account_id).create_task(
+            run(), name=f"ui-action-{action}"
+        )
+
+    def _handle_action_outcome(self, resource_key: str, action: str, outcome) -> None:
+        if isinstance(outcome, Accepted):
+            self._toast(f"{_ACTION_LABELS.get(action, action)}: {outcome.user_message}")
+            self._schedule_pending_timeout(resource_key)
+            return
+
+        # Every non-accepted outcome lifts the suppression -- no transition was triggered.
+        self._pending.clear(resource_key)
+        if isinstance(outcome, ActionConsentRequired):
+            self._present_action_consent_required(outcome)
+        elif isinstance(outcome, ContractError):
+            self._toast(outcome.user_message)  # the gate now disables this action (FR-5-AC-5)
+        else:
+            self._toast(outcome.user_message)
+        self._render()
+
+    def _schedule_pending_timeout(self, resource_key: str) -> None:
+        """D-8's bounded wait: if no clean refresh resolves the transition within the stated
+        timeout, re-read state (trigger a refresh) rather than staying suppressed forever."""
+        account_id = self._auth.active_account_id
+
+        async def watchdog() -> None:
+            await asyncio.sleep(POST_ACTION_REFRESH_TIMEOUT_SECONDS)
+            if self._pending.pending_action(resource_key) is not None:
+                logger.info(
+                    "ui_shell: post-action refresh timed out for %s; re-reading state",
+                    resource_key,
+                )
+                self._pending.clear(resource_key)
+                self._trigger_refresh()
+
+        self._task_registry.get_or_create_group(account_id).create_task(
+            watchdog(), name="ui-action-timeout"
+        )
+
+    def _present_action_consent_required(self, outcome) -> None:
+        """FR-5-AC-4's guided surface: explain that a tenant admin must approve, offering the
+        admin-consent URL for forwarding when one exists."""
+        dialog = Adw.AlertDialog(
+            heading="Administrator approval needed",
+            body=(
+                outcome.user_message
+                + (
+                    "\n\nCopy the approval link and forward it to an administrator."
+                    if outcome.admin_consent_url
+                    else ""
+                )
+            ),
+        )
+        dialog.add_response("close", "Close")
+        if outcome.admin_consent_url:
+            dialog.add_response("copy", "Copy approval link")
+
+            def on_response(_dialog, response: str) -> None:
+                if response == "copy":
+                    self.get_clipboard().set(outcome.admin_consent_url)
+
+            dialog.connect("response", on_response)
+        dialog.set_default_response("close")
+        dialog.set_close_response("close")
+        dialog.present(self)
 
     # -- rendering ---------------------------------------------------------------------------
 
@@ -563,10 +705,14 @@ class MainWindow(Adw.ApplicationWindow):
             self._list_box.remove(child)
             child = next_child
 
-        groups = ui_models.build_groups(
-            selection.entries, self._bookmarks, pending=self._pending
-        )
         account_id = self._auth.active_account_id
+        groups = ui_models.build_groups(
+            selection.entries,
+            self._bookmarks,
+            pending=self._pending,
+            admin_capable=self._admin_capable.get(account_id, False) if account_id else False,
+            action_gate=lambda action: ui_models.Availability(*self._actions.action_gate(action)),
+        )
 
         for group in groups:
             pref_group = Adw.PreferencesGroup()

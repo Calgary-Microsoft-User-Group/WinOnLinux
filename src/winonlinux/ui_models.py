@@ -17,11 +17,10 @@ Two invariants are made structurally unrepresentable rather than merely followed
   build has never heard of -- renders not connectable. The full status × action matrix is
   outstanding (G-19, P1); it drops in as data here, not as new mechanism.
 
-Launcher/actions reality of this build: web launch is live (``add-web-launcher``, applied);
-``add-native-launcher`` and ``add-cloudpc-actions`` are unapplied, so :data:`BUILD_LAUNCHERS`'s
-native half and :data:`ACTIONS_SERVICE_AVAILABILITY` describe those dispatch paths as
-unavailable-with-reason. Those changes flip these inputs when they land; nothing else in this
-module changes.
+Launcher/actions reality of this build: web launch (``add-web-launcher``) and Cloud PC actions
+(``add-cloudpc-actions``, via the ``service_gate`` the widget layer passes in) are live;
+``add-native-launcher`` is unapplied, so :data:`BUILD_LAUNCHERS`'s native half stays
+unavailable-with-reason until it lands.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ from __future__ import annotations
 import enum
 import logging
 from dataclasses import dataclass, field
+from typing import Callable
 
 from winonlinux import graph_client
 from winonlinux.auth_state import AuthState
@@ -118,9 +118,12 @@ BUILD_LAUNCHERS = LauncherAvailability(
 #: bookmark source with laxer validation cannot silently compose a broken URL.
 AVD_IDS_UNKNOWN_REASON = "Web launch unavailable: workspace/resource ID unknown"
 
-#: Same for the Cloud PC management actions service (add-cloudpc-actions, unapplied).
+#: Fallback action gate used when no ``service_gate`` is supplied (pure-model tests, or a
+#: shell constructed without the actions service). The REAL gate is
+#: ``CloudPcActionService.action_gate`` (add-cloudpc-actions), passed into
+#: :func:`cloudpc_actions`/:func:`build_groups` by the widget layer.
 ACTIONS_SERVICE_AVAILABILITY = Availability(
-    False, "Cloud PC management actions are not included in this build yet"
+    False, "Cloud PC management actions are not available"
 )
 
 #: §7.4 mechanism/data split: statuses known to permit connection. The full status × action
@@ -353,6 +356,11 @@ class PendingTransitions:
         """Called on every successful enumeration -- the refresh has resolved the new state."""
         self._pending.clear()
 
+    def clear(self, resource_key: str) -> None:
+        """Clear one resource's suppression -- the D-8 bounded-timeout path (the refresh never
+        resolved in time; state is re-read rather than assumed) and failed-outcome paths."""
+        self._pending.pop(resource_key, None)
+
 
 #: §4.3's always-rendered Cloud PC actions, in menu order.
 CLOUDPC_ACTIONS = ("restart", "rename", "troubleshoot", "reprovision")
@@ -365,29 +373,45 @@ CLOUDPC_ADMIN_ACTIONS = ("restore", "resize")
 def cloudpc_actions(
     resource_key: str,
     *,
+    status: str | None = None,
     admin_capable: bool = False,
     pending: PendingTransitions | None = None,
-    service: Availability = ACTIONS_SERVICE_AVAILABILITY,
+    service_gate: "Callable[[str], Availability] | None" = None,
 ) -> dict[str, Availability]:
     """Availability for the §4.3 action menu.
 
-    ``admin_capable`` defaults False: no admin-capability signal exists in this build (the
-    wids-claim detection is add-cloudpc-actions work, D-7), and FR-5-AC-3 says
-    capability-unknown renders not capable -- so Restore/Resize are absent from the returned
-    dict entirely unless capability is affirmatively known.
+    ``service_gate`` is ``CloudPcActionService.action_gate`` wrapped into an
+    :class:`Availability` by the widget layer -- it carries the beta flag (§7.2), the
+    national-cloud wholesale disable (FR-5-AC-6), and per-session contract disables
+    (FR-5-AC-5). Pending-transition suppression (§7.4) wins over everything.
+
+    ``admin_capable`` defaults False: FR-5-AC-3 says capability-unknown renders not capable --
+    Restore/Resize are absent from the returned dict entirely unless capability is
+    affirmatively known (D-7's wids evaluation, add-cloudpc-actions).
     """
     pending_action = pending.pending_action(resource_key) if pending is not None else None
+    # §7.4 interim status rule for ACTIONS (G-19 owns the real per-action matrix): permitted
+    # only on the same steady usable state as connecting; unknown/unrecognized fails closed.
+    status_ok = status in CONNECTABLE_CLOUDPC_STATUSES
 
-    def gate() -> Availability:
+    def gate(action: str) -> Availability:
         if pending_action is not None:
             return Availability(
                 False,
                 f"Waiting for the next refresh to resolve the pending {pending_action}",
             )
-        return service
+        if not status_ok:
+            shown = status if status else "unknown"
+            return Availability(
+                False,
+                f"This Cloud PC's current status ({shown}) does not permit this action",
+            )
+        if service_gate is not None:
+            return service_gate(action)
+        return ACTIONS_SERVICE_AVAILABILITY
 
     names = CLOUDPC_ACTIONS + (CLOUDPC_ADMIN_ACTIONS if admin_capable else ())
-    return {name: gate() for name in names}
+    return {name: gate(name) for name in names}
 
 
 # --- grouping (§4.1) -----------------------------------------------------------------------------
@@ -413,6 +437,7 @@ def build_groups(
     pending: PendingTransitions | None = None,
     admin_capable: bool = False,
     launchers: LauncherAvailability = BUILD_LAUNCHERS,
+    action_gate: "Callable[[str], Availability] | None" = None,
 ) -> list[ResourceGroup]:
     """Compose the §4.1 grouped list: one "Windows 365" group, then one "Azure Virtual Desktop"
     group per workspace (via :func:`~winonlinux.avd_bookmarks.group_by_workspace`). Groups with
@@ -429,7 +454,11 @@ def build_groups(
                 status=entry.status or None,
                 methods=connect_methods(cloudpc_connect_gate(entry.status), launchers),
                 actions=cloudpc_actions(
-                    cloudpc_resource_key(entry), admin_capable=admin_capable, pending=pending
+                    cloudpc_resource_key(entry),
+                    status=entry.status,
+                    admin_capable=admin_capable,
+                    pending=pending,
+                    service_gate=action_gate,
                 ),
             )
             for entry in entries
