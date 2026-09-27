@@ -282,3 +282,121 @@ def test_close_is_idempotent_and_safe_without_start():
         await started.close()
 
     asyncio.run(scenario())
+
+
+# -- oversized and stalled connections (add-audit-test-coverage, audit F-10) -------------------
+
+
+def test_oversized_request_line_is_rejected_without_consuming_the_accept_slot():
+    """A request line past the 16 KiB cap gets the invalid-request response, and a subsequent
+    correct redirect on a new connection is still accepted -- the cap is a per-connection
+    defense, not a listener-wide denial (spec.md section 10.3)."""
+
+    async def scenario():
+        listener = LoopbackListener(timeout_seconds=5.0)
+        try:
+            port = await listener.start()
+            wait_task = asyncio.ensure_future(listener.wait_for_redirect("good-state"))
+
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            try:
+                # One request line far past _MAX_REQUEST_BYTES, no newline until the very end.
+                writer.write(b"GET /?state=" + b"A" * (20 * 1024) + b" HTTP/1.1\r\n\r\n")
+                try:
+                    await writer.drain()
+                except (ConnectionResetError, BrokenPipeError):
+                    pass  # the handler may already have rejected and closed on us
+                oversized_response = await reader.read()
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+            # Either an explicit 400 or an early close -- never a 200, never an acceptance.
+            if oversized_response:
+                assert oversized_response.startswith(b"HTTP/1.1 400")
+            assert not wait_task.done()
+
+            # The genuine redirect still lands: the slot was not consumed.
+            good_response = await _send_redirect(port, "code=real-code&state=good-state")
+            assert good_response.startswith(b"HTTP/1.1 200 OK")
+            result = await wait_task
+            assert result.query_params["code"] == "real-code"
+        finally:
+            await listener.close()
+
+    asyncio.run(scenario())
+
+
+def test_stalled_connection_is_freed_at_the_read_timeout_and_real_redirect_succeeds(monkeypatch):
+    """Slowloris check: a connection that never completes its request line is released at the
+    per-connection read timeout (shrunk here so the test runs in real time), while the genuine
+    redirect on another connection completes within the deadline."""
+    from winonlinux import auth_loopback
+
+    monkeypatch.setattr(auth_loopback, "_REQUEST_READ_TIMEOUT_SECONDS", 0.2)
+
+    async def scenario():
+        listener = LoopbackListener(timeout_seconds=5.0)
+        try:
+            port = await listener.start()
+            wait_task = asyncio.ensure_future(listener.wait_for_redirect("good-state"))
+
+            # The staller: connects, sends a partial request line, never finishes it.
+            stall_reader, stall_writer = await asyncio.open_connection("127.0.0.1", port)
+            stall_writer.write(b"GET /?st")  # no newline, ever
+            await stall_writer.drain()
+
+            # The genuine redirect is not blocked by the stalled handler.
+            started = time.monotonic()
+            good_response = await _send_redirect(port, "code=real-code&state=good-state")
+            assert good_response.startswith(b"HTTP/1.1 200 OK")
+            assert (time.monotonic() - started) < 2.0
+            result = await wait_task
+            assert result.query_params["code"] == "real-code"
+
+            # And the staller is freed at the shrunken read timeout with the invalid response
+            # (an "already used" 410 would also be a non-acceptance; the point is it is released
+            # and never parsed into a result).
+            stalled_response = await asyncio.wait_for(stall_reader.read(), timeout=2.0)
+            if stalled_response:
+                assert not stalled_response.startswith(b"HTTP/1.1 200")
+            stall_writer.close()
+            try:
+                await stall_writer.wait_closed()
+            except Exception:
+                pass
+        finally:
+            await listener.close()
+
+    asyncio.run(scenario())
+
+
+def test_listener_binds_loopback_only_on_distinct_ephemeral_ports():
+    """Pins the bind-host and ephemeral-port properties directly via getsockname() (audit F-22,
+    controls 4 and 5): 127.0.0.1 exactly -- never wildcard -- and a fresh non-privileged port
+    per listener."""
+
+    async def scenario():
+        first = LoopbackListener(timeout_seconds=5.0)
+        second = LoopbackListener(timeout_seconds=5.0)
+        try:
+            port_one = await first.start()
+            port_two = await second.start()
+
+            for listener, port in ((first, port_one), (second, port_two)):
+                socknames = [s.getsockname() for s in listener._server.sockets]
+                assert socknames, "listener should hold at least one bound socket"
+                for host, bound_port, *_rest in socknames:
+                    assert host == "127.0.0.1"
+                    assert bound_port == port
+                    assert bound_port > 1024
+
+            assert port_one != port_two
+        finally:
+            await first.close()
+            await second.close()
+
+    asyncio.run(scenario())

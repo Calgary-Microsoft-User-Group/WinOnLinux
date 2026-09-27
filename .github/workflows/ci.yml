@@ -9,14 +9,23 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every CPython minor the project declares support for (requires-python >=3.11): the
+        # asyncio-bridge private-API dependence and every asyncio primitive's loop affinity are
+        # continuously verified across this range instead of assumed (add-audit-test-coverage,
+        # audit F-09/F-22; the 3.12 serializer failure the 2026-09-22 audit found was invisible
+        # to a 3.11-only CI).
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       # Minimal system packages needed for PyGObject to build/import GTK4 and
       # libadwaita bindings: GI typelibs for Gtk 4 and Adw 1, the GObject
@@ -33,8 +42,19 @@ jobs:
             gir1.2-adw-1 \
             python3-gi
 
-      - name: Install project with test extras
-        run: python -m pip install -e ".[test]"
+      # constraints.txt pins the full resolved pip set (D-23): the tested set and the shipped
+      # set are one artifact -- the future Flatpak manifest consumes the same file.
+      - name: Install project with test extras (pinned)
+        run: python -m pip install -e ".[test]" -c constraints.txt
 
       - name: Run tests
         run: python -m pytest
+
+      # Report-only for now (promote to blocking once it has been quiet for a while --
+      # add-audit-test-coverage tasks.md 3.3): flags CVEs that appear in the pinned set
+      # between deliberate constraints regenerations.
+      - name: Audit pinned dependencies for known CVEs
+        continue-on-error: true
+        run: |
+          python -m pip install pip-audit
+          python -m pip_audit -r constraints.txt --no-deps

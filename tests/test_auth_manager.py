@@ -1096,3 +1096,68 @@ def test_two_managers_in_two_loops_contend_their_own_serializers_without_cross_l
 
     run_contended_acquisitions()  # loop 1, manager 1
     run_contended_acquisitions()  # loop 2, manager 2 -- must not see loop 1's lock
+
+
+# --- add-audit-test-coverage (audit F-22/F-23): authority pin, placeholder WARNING ----------------
+
+
+class _RecordingMsalConstructor:
+    """Records every msal.PublicClientApplication(...) construction start() performs."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, client_id, *, authority=None, token_cache=None):
+        self.calls.append(
+            {"client_id": client_id, "authority": authority, "token_cache": token_cache}
+        )
+        return FakeMsalApp()
+
+
+def test_authority_derives_only_from_constructor_arguments(monkeypatch):
+    """Pins that the authority is composed from constructor args alone -- hostile environment
+    variables and state-file-shaped inputs have no path into it (an authority override would be
+    a token-exfiltration vector; audit F-22/D-10 note, spec.md section 6.1)."""
+    recording = _RecordingMsalConstructor()
+    monkeypatch.setattr(auth_manager.msal, "PublicClientApplication", recording)
+    monkeypatch.setattr(auth_manager, "build_persisted_cache", lambda: object())
+    # Hostile environment: nothing in AuthManager reads any of these.
+    monkeypatch.setenv("WINONLINUX_AUTHORITY", "https://evil.example/tenant")
+    monkeypatch.setenv("MSAL_AUTHORITY", "https://evil.example/tenant")
+    monkeypatch.setenv("AUTHORITY", "https://evil.example/tenant")
+
+    async def scenario():
+        manager = AuthManager(task_registry=FakeTaskRegistry(), client_id="test-client-id")
+        await manager.start()
+        manager_custom = AuthManager(
+            task_registry=FakeTaskRegistry(), client_id="test-client-id", tenant="contoso.com"
+        )
+        await manager_custom.start()
+
+    asyncio.run(scenario())
+
+    assert [call["authority"] for call in recording.calls] == [
+        "https://login.microsoftonline.com/organizations",
+        "https://login.microsoftonline.com/contoso.com",
+    ]
+
+
+def test_placeholder_client_id_warning_fires_exactly_once_across_two_starts(monkeypatch, caplog):
+    """Pins the D-19 placeholder WARNING (audit F-23, DECIDED-BUT-UNVERIFIED's verifiable half):
+    it fires on the first start() with the placeholder still in place, and only once
+    process-wide."""
+    monkeypatch.setattr(auth_manager.msal, "PublicClientApplication", _RecordingMsalConstructor())
+    monkeypatch.setattr(auth_manager, "build_persisted_cache", lambda: object())
+    monkeypatch.setattr(auth_manager, "_placeholder_warning_emitted", False)
+
+    async def scenario():
+        with caplog.at_level(logging.WARNING, logger="winonlinux.auth_manager"):
+            first = AuthManager(task_registry=FakeTaskRegistry())  # placeholder client id
+            await first.start()
+            second = AuthManager(task_registry=FakeTaskRegistry())
+            await second.start()
+
+    asyncio.run(scenario())
+
+    warnings = [r for r in caplog.records if "PLACEHOLDER client ID" in r.getMessage()]
+    assert len(warnings) == 1

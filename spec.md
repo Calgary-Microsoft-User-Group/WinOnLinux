@@ -1308,6 +1308,13 @@ Verification codes: **U** unit/fixture · **I** integration against a live tenan
     (fix-account-lifecycle change, 2026-09-25, audit F-18/A-10) so it is verified alongside V1's `msal-extensions`
     check rather than trusted silently — if MSAL ever attempts proactive refresh and raises on network failure, a
     valid cached AT could exist while the client reports Offline.
+16. **Private CPython internals the event-loop bridge depends on are now CI-verified, not assumed.**
+    `BaseEventLoop._run_once`, `asyncio.events._set_running_loop`, and the daemon-executor thread-spawn override
+    in `asyncio_bridge` are underscore-API dependencies with no compatibility contract. As of the
+    add-audit-test-coverage change (2026-09-27), CI runs the unit suite on every supported CPython minor
+    (3.11–3.13), so a breaking change in any of them fails CI before a release rather than surfacing in an audit
+    or in the field. The `Retry-After` integer-seconds assumption (§9) is likewise now pinned: the HTTP-date form's
+    fall-back-to-backoff behavior has a dedicated test rather than a docstring note.
 
 ---
 
@@ -1399,6 +1406,7 @@ reversing one is a deliberate act with a stated cause rather than a drift.
 | **D-18** | **Single asyncio event loop**; per-account task groups keyed by home account ID; blocking keyring and subprocess calls in a thread executor | Follows from D-16. Task groups give FR-3-AC-2's cancellation-on-account-switch directly, and a per-account lock plus shared in-flight future gives §6.3 single-flight. GTK application uniqueness supplies FR-4-AC-7 nearly free | Cancellation proves insufficient for in-flight Graph actions rather than just enumeration |
 | **D-21** | The **application ID** (`io.github.CalgaryMicrosoftUserGroup.WinOnLinux`) is fixed and owned by `add-app-foundation` — it is the GApplication ID (FR-4-AC-7 uniqueness) from the first commit, and `add-flatpak-packaging` consumes the same constant rather than choosing its own | The OpenSpec proposal review (2026-09-14) found `add-app-foundation` and `add-flatpak-packaging` each reading as if it originated this identifier, with no task in either reconciling order. app-foundation needs a concrete value to implement GTK single-instance uniqueness before flatpak-packaging's own tasks run, so it is the one that must own the choice; flatpak-packaging imports `winonlinux.app.APPLICATION_ID` into its manifest/desktop file/AppStream metadata rather than defining its own | The ID needs to change for a distribution/branding reason — this is a one-string rename, not an architectural reversal |
 | **D-22** | The **FreeRDP runtime version probe** is implemented exactly once, in `add-app-foundation` (`winonlinux.freerdp_probe`), cached per app session; `add-native-launcher` calls it rather than re-probing | The OpenSpec proposal review (2026-09-14) found the probe specified twice with contradictory semantics — a per-app-session cache with "present but unknown" on unparseable output in app-foundation, versus a per-binary-path cache with re-probe-before-launch and fail-closed-on-unparseable in native-launcher's own draft. A single owner avoids two components disagreeing about whether a borderline FreeRDP install is usable | `add-native-launcher` needs a *fresher* probe than session-cached (e.g. FreeRDP was installed/upgraded mid-session) — in which case the fix is an explicit re-probe entry point on the existing module, not a second implementation |
+| **D-23** | Dependencies are pinned by a **`pip-compile`-generated `constraints.txt`**: CI installs with it, the Flatpak manifest (D-3) consumes it as its pinned module list, and declared floors exclude known-CVE versions (`requests>=2.32.4`). Floors + constraints, deliberately **not** upper version bounds (caps rot) and not a per-tool lockfile | One artifact makes the tested set and the shipped set identical, keeps `pip install -e .` workflows intact for contributors, and gives the Flatpak manifest a flat pinned list to consume; CI's `pip-audit` step flags CVEs that appear between deliberate regenerations (add-audit-test-coverage change, 2026-09-27, audit F-12) | Flatpak manifest generation adopts a tool that consumes a different pin format |
 
 ### 14.2 Identity and security
 

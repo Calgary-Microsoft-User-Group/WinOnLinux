@@ -39,3 +39,23 @@ def test_main_installs_redaction_before_run(monkeypatch, caplog):
     assert rc == 0
     leaked = fake_token in caplog.text
     assert not leaked, "a token logged during run() was not redacted on the direct entry path"
+
+
+def test_constructor_builds_nothing_stateful_before_first_activate():
+    """Pins the automatable half of control 15 (second-process no-side-effects, FR-4-AC-7):
+    constructing the application object creates no token cache, state store, provider, bookmark
+    store, or task registry -- all stateful construction waits for _first_activate, which a
+    remote second instance never reaches. The D-Bus forwarding half stays manual
+    (tests/manual/app_uniqueness.md)."""
+    install_gi_stub()
+    from winonlinux import app as app_module
+
+    app = app_module.WinOnLinuxApplication(cold_start_reference=None)
+
+    assert app.task_registry is None
+    assert app.state_store is None
+    assert app.auth_manager is None
+    assert app.cloudpc_provider is None
+    assert app.avd_bookmarks is None
+    assert app.freerdp_probe_result is None
+    assert app.auth_manager_start_error is None

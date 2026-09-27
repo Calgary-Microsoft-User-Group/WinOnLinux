@@ -52,6 +52,12 @@ _logger = logging.getLogger(__name__)
 # guards against a misbehaving or hostile connection trying to make us buffer indefinitely.
 _MAX_REQUEST_BYTES = 16 * 1024
 
+#: Per-connection bound on reading the request line: a client that connects and then trickles
+#: (or sends nothing) is released after this long, freeing its handler without consuming the
+#: overall deadline or the single-accept slot. Module-level (rather than an inline literal) so
+#: tests can shrink it and exercise the stall path in real time (add-audit-test-coverage, F-10).
+_REQUEST_READ_TIMEOUT_SECONDS = 10.0
+
 _OK_BODY = b"You may close this window and return to WinOnLinux."
 _RESPONSE_OK = (
     b"HTTP/1.1 200 OK\r\n"
@@ -305,7 +311,9 @@ class LoopbackListener:
         intent without needing a manual byte-count loop.
         """
 
-        request_line = await asyncio.wait_for(reader.readline(), timeout=10.0)
+        request_line = await asyncio.wait_for(
+            reader.readline(), timeout=_REQUEST_READ_TIMEOUT_SECONDS
+        )
         if not request_line:
             raise ValueError("empty request")
 

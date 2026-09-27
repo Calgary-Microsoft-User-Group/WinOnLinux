@@ -19,8 +19,11 @@ dependencies = [
     # msal itself depends on requests transitively, but winonlinux.auth_manager imports and
     # catches requests.exceptions.RequestException directly (network-error classification for
     # FR-4-AC-5's Offline state), so it is declared explicitly here rather than relied on as an
-    # undeclared transitive dependency.
-    "requests>=2.27.0",
+    # undeclared transitive dependency. Floor 2.32.4 excludes the known-CVE range below it --
+    # CVE-2023-32681 (Proxy-Authorization forwarded cross-host), CVE-2024-35195, and
+    # CVE-2024-47081 (.netrc credential leak via trust_env, the exact proxy-inheritance path
+    # spec.md section 5.9 relies on) -- per D-23 (add-audit-test-coverage, audit F-12).
+    "requests>=2.32.4",
 ]
 
 [project.optional-dependencies]

@@ -315,3 +315,22 @@ def test_uuid_embedded_inside_a_longer_token_run_is_not_carved_out(caplog, test_
     leaked = FAKE_CLOUDPC_GUID in caplog.text
     assert not leaked
     assert REDACTION_MARKER in caplog.text
+
+
+# --- third-party logger coverage (add-audit-test-coverage, audit F-22) -----------------------
+
+
+def test_redaction_applies_to_third_party_logger_records(caplog):
+    """The record factory is logger-agnostic by construction, but the §10.7 requirement that
+    third-party DEBUG output (urllib3 can log request headers) is redacted was untested -- this
+    pins it with a urllib3-named logger."""
+    configure_logging(verbose=False)
+    third_party = logging.getLogger("urllib3.connectionpool")
+    third_party.setLevel(logging.DEBUG)
+
+    with caplog.at_level(logging.DEBUG, logger="urllib3.connectionpool"):
+        third_party.debug("Starting new HTTPS connection: %s", FAKE_AUTH_HEADER)
+
+    header_leaked = FAKE_ACCESS_TOKEN in caplog.text
+    assert not header_leaked
+    assert REDACTION_MARKER in caplog.text

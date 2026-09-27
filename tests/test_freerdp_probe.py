@@ -252,3 +252,30 @@ def test_probe_dispatches_through_the_running_loops_executor(monkeypatch):
 
     assert calls == ["executor"]
     assert result.meets_floor is True
+
+
+# -- argument-vector discipline (add-audit-test-coverage, audit F-22, control 14) --------------
+
+
+def test_probe_invokes_argument_vector_with_no_shell(monkeypatch):
+    """Pins control 14: the subprocess invocation is exactly `[binary, "/version"]` as a list
+    argument vector, with no `shell` kwarg -- a regression to shell=True would fail here, not
+    slip through."""
+    recorded: dict = {}
+
+    def recording_run(args, **kwargs):
+        recorded["args"] = args
+        recorded["kwargs"] = kwargs
+        return _fake_completed("This is FreeRDP version 3.30.0 (abcdef123)", "")
+
+    monkeypatch.setattr(freerdp_probe.shutil, "which", lambda name: "/usr/bin/xfreerdp")
+    monkeypatch.setattr(freerdp_probe.subprocess, "run", recording_run)
+    reset_cache()
+
+    result = probe_sync()
+
+    assert result.present is True
+    assert isinstance(recorded["args"], list)
+    assert recorded["args"] == ["/usr/bin/xfreerdp", "/version"]
+    assert "shell" not in recorded["kwargs"]
+    assert recorded["kwargs"].get("timeout") == 5.0

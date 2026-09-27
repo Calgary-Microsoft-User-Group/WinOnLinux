@@ -45,6 +45,9 @@ artifact the native path later fills in.
 - **Depends on**: `add-app-foundation` (application ID, runtime layout, XDG state paths per D-13). Full value —
   bundled FreeRDP actually used — arrives with `add-native-launcher`; until then the Flatpak ships the web-only
   Phase 0 client.
+- **Pinned Python modules come from `constraints.txt`** (D-23, added by `add-audit-test-coverage` 2026-09-27):
+  the manifest consumes the same pip-compile-generated pin set CI tests — no independently chosen versions.
+  PyGObject is the exception: it comes from the GNOME runtime, not pip (see the constraints file's header).
 - **Bounds other work**: the portal costs bound §5.5's channel set; anything that proves harder than §5.8 states
   removes a capability from §5.5 knowingly rather than late. V2 findings can fire D-3's revisit trigger.
 - **Unverified facts relied on** (per §12 risk 14 and §14.4): Flatpak portal/proxy/X11-socket exposure is
