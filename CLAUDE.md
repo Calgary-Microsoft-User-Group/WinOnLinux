@@ -5,26 +5,30 @@ Guidance for Claude Code working in this repository.
 ## What this repo is
 
 WinOnLinux — a Linux desktop client for Windows 365 Cloud PCs and Azure Virtual Desktop. The repo started as
-**specification-only** and is now a **live coding repo**. As of 2026-09-27, **five of the ten OpenSpec changes are
-applied**: `add-app-foundation`, `add-auth-account-manager`, `add-cloudpc-enumeration`, `add-ui-shell`, and
-`add-web-launcher` (the last two complete except their live-tenant/desktop manual passes). The remaining five
-(`add-avd-feed-provider`, `add-cloudpc-actions`, `add-connection-config-provider`, `add-flatpak-packaging`,
-`add-native-launcher`) sit in `openspec/changes/`, the native-path ones gated on Stage 0/1 and LG-1. Six further
-changes from the 2026-09-22 code audit (`codeaudit/2026-09-22.md` — all 26 findings closed) are implemented and
-archived under `openspec/changes/archive/`. The app signs in, enumerates Cloud PCs, and launches web sessions
-end to end.
+**specification-only** and is now a **live coding repo**. As of 2026-09-27, **every non-gated OpenSpec change is
+implemented**: the three foundations (`add-app-foundation`, `add-auth-account-manager`, `add-cloudpc-enumeration`,
+applied and still active in `openspec/changes/`) plus `add-ui-shell`, `add-web-launcher`, and
+`add-cloudpc-actions` (implemented and archived), alongside the six 2026-09-22 audit-remediation changes
+(`codeaudit/2026-09-22.md` — all 26 findings closed), all under `openspec/changes/archive/2026-09-27-*`. The app
+signs in, enumerates Cloud PCs, launches web sessions, and invokes Cloud PC management actions end to end. The
+four remaining changes (`add-avd-feed-provider`, `add-connection-config-provider`, `add-native-launcher`,
+`add-flatpak-packaging`) are **gated on Stage 0/1 and LG-1** — the next code work in this repo waits on those
+gates. Outstanding M/I-level live-tenant/desktop verifications from the archived feature changes are collected in
+Linear **BIG-345** (blocked on the D-19 app registration; nothing signs in for real against the placeholder
+client ID).
 
-Build/test commands now exist: `python -m pytest` runs the unit suite (~280 tests, `-m unit` is the default;
-hermetic, no display server). CI (`.github/workflows/ci.yml`) runs it on Python 3.11/3.12/3.13 with the pinned
-`constraints.txt` set (D-23) plus a report-only `pip-audit`. `spec.md` stays normative for requirements and
-decisions throughout; OpenSpec changes implement it, they don't replace it as the source of truth.
+Build/test commands: `python -m pytest` runs the unit suite (~300 tests, `-m unit` is the default; hermetic, no
+display server; a `gi` stub in `tests/conftest.py` covers the GTK-importing modules headlessly). CI
+(`.github/workflows/ci.yml`) runs it on Python 3.11/3.12/3.13 with the pinned `constraints.txt` set (D-23) plus a
+report-only `pip-audit`. `spec.md` stays normative for requirements and decisions throughout; OpenSpec changes
+implement it, they don't replace it as the source of truth.
 
 ```
 spec.md                   The specification. §14 is the decision register — authoritative.
 gapsandrecommendations.md  Completeness/feasibility assessment: 54 findings (G-nn), applied + backlog.
 README.md                  Public-facing summary.
-src/winonlinux/            The application (19 modules): auth, Graph, providers, view models, GTK shell.
-tests/                     Unit suite (~280 tests, pytest -m unit; gi stub in conftest for headless CI).
+src/winonlinux/            The application (21 modules): auth, Graph, providers, launchers, actions, GTK shell.
+tests/                     Unit suite (~300 tests, pytest -m unit; gi stub in conftest for headless CI).
 constraints.txt            Pinned dependency set (D-23) — CI installs with it; Flatpak will consume it.
 codeaudit/2026-09-22.md    The code audit: 26 findings, controls matrix, assumed-facts register. All closed.
 openspec/changes/*/        Remaining OpenSpec change proposals (see above); archive/ holds completed ones.
@@ -39,7 +43,7 @@ Execution is tracked in **Linear** — team `BigHatGroup` (workspace `linear.app
 | `WindowsAppforLinuxPrereq` | Tenant, licence, hardware, tooling procurement (E-1…E-11) | Spec or code work |
 | `WindowsAppForLinuxImpl` | Open specification and decision gaps (G-nn) | Procurement or execution |
 | `WindowsAppForLinuxSprint1` | The 5-day feasibility sprint (S-0…S-7, V3, LG-1) | Anything beyond the sprint |
-| `WinOnLinuxCode` | Application code, one issue per OpenSpec change under `openspec/changes/` (10 original + 6 audit-remediation issues BIG-337…BIG-342, the latter all Done); ordering enforced by Linear blocking relations, Phase 1 issues titled `(GATED: Stage 0/1, LG-1)`. BIG-287/BIG-273 are In Progress pending manual desktop/tenant passes | Spec/decision gaps or procurement |
+| `WinOnLinuxCode` | Application code, one issue per OpenSpec change under `openspec/changes/` (10 original + 6 audit-remediation issues BIG-337…BIG-342, the latter all Done); ordering enforced by Linear blocking relations, Phase 1 issues titled `(GATED: Stage 0/1, LG-1)`. BIG-287/BIG-273/BIG-274 are Done; their outstanding live-tenant/desktop verifications are collected in BIG-345 | Spec/decision gaps or procurement |
 
 Older references to "Prerequisites", "Implementation", and "Sprint 1" project names elsewhere (including earlier in this file's history) mean
 `WindowsAppforLinuxPrereq`, `WindowsAppForLinuxImpl`, and `WindowsAppForLinuxSprint1` respectively — those are the actual Linear project
