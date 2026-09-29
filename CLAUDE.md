@@ -10,12 +10,15 @@ implemented**: the three foundations (`add-app-foundation`, `add-auth-account-ma
 applied and still active in `openspec/changes/`) plus `add-ui-shell`, `add-web-launcher`, and
 `add-cloudpc-actions` (implemented and archived), alongside the six 2026-09-22 audit-remediation changes
 (`codeaudit/2026-09-22.md` — all 26 findings closed), all under `openspec/changes/archive/2026-09-27-*`. The app
-signs in, enumerates Cloud PCs, launches web sessions, and invokes Cloud PC management actions end to end. The
-four remaining changes (`add-avd-feed-provider`, `add-connection-config-provider`, `add-native-launcher`,
-`add-flatpak-packaging`) are **gated on Stage 0/1 and LG-1** — the next code work in this repo waits on those
-gates. Outstanding M/I-level live-tenant/desktop verifications from the archived feature changes are collected in
-Linear **BIG-345** (blocked on the D-19 app registration; nothing signs in for real against the placeholder
-client ID).
+signs in, enumerates Cloud PCs, launches web sessions, and invokes Cloud PC management actions end to end —
+and every commit builds an **installable Phase 0 Flatpak artifact** in CI (`add-flatpak-packaging`'s ungated
+web-only half landed 2026-09-29: manifest, desktop/AppStream data, per-commit build job; its Gate STACK V2
+evidence, deb/rpm, and channel decision remain open on BIG-286). The three fully gated changes
+(`add-avd-feed-provider`, `add-connection-config-provider`, `add-native-launcher`) are **blocked on Stage 0/1
+and LG-1** — their gate-precondition checks were run 2026-09-29 and fail (no Stage 0 finding, no LG-1 position,
+no Stage 1 schema/fixtures); per D-14 that is a stop, not a workaround. Outstanding M/I-level live-tenant/desktop
+verifications from the archived feature changes are collected in Linear **BIG-345** (blocked on the D-19 app
+registration; nothing signs in for real against the placeholder client ID).
 
 Build/test commands: `python -m pytest` runs the unit suite (~300 tests, `-m unit` is the default; hermetic, no
 display server; a `gi` stub in `tests/conftest.py` covers the GTK-importing modules headlessly). CI
@@ -31,6 +34,9 @@ src/winonlinux/            The application (21 modules): auth, Graph, providers,
 tests/                     Unit suite (~300 tests, pytest -m unit; gi stub in conftest for headless CI).
 constraints.txt            Pinned dependency set (D-23) — CI installs with it; Flatpak will consume it.
 codeaudit/2026-09-22.md    The code audit: 26 findings, controls matrix, assumed-facts register. All closed.
+packaging/flatpak/         Flatpak manifest (Phase 0, web-only) + the pinned Phase 1 FreeRDP module.
+data/                      Desktop file, AppStream metainfo, icon — all under the D-21 application ID.
+docs/RELEASING.md          Release checklist: FreeRDP re-pin, constraints regeneration, channel decision.
 openspec/changes/*/        Remaining OpenSpec change proposals (see above); archive/ holds completed ones.
 docs/superpowers/specs/2026-08-18-...-design.md
                            Original native-path design. Partly superseded by spec.md.
@@ -95,7 +101,9 @@ awk 'BEGIN{t=0} /^\|/{n=gsub(/\|/,"|"); if(!t){t=1;h=n} else if(n!=h) print "COL
 
 This problem space has changed repeatedly and much of the research **postdates mid-2026**. Several load-bearing claims
 are dated July–August 2026: the removal of the web client's `.rdpw` download, Microsoft's Q&A answer that no public API
-exists, FreeRDP 3.30.0's contents, the first-party AVD client ID and feed scope, `arm.c`'s signature handling.
+exists, FreeRDP 3.30.0's contents (its **existence** was verified against upstream 2026-09-29 — tag + commit pinned in
+`packaging/flatpak/freerdp-module.yml`; contents/buildability remain open), the first-party AVD client ID and feed
+scope, `arm.c`'s signature handling.
 
 When these come up, mark them as needing verification rather than stating them as current fact. `spec.md` §12 risk 14
 lists them; re-verification is the first task of Stage 0. The same applies to FreeRDP flag names (§5.5) — verify
