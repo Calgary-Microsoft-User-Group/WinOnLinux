@@ -1,0 +1,33 @@
+# FreeRDP module for the Phase 1 Flatpak (add-flatpak-packaging tasks 2.3; D-20, §2.2 floor).
+#
+# NOT included in the Phase 0 manifest -- the native path is disabled until
+# add-native-launcher lands (gated: Stage 0/1, LG-1). When it does, append this module to the
+# manifest's `modules:` list ABOVE the winonlinux module and revisit the X11 socket per V2.
+#
+# Pin verified 2026-09-29 against upstream (git ls-remote): tag 3.30.0 exists, peeled commit
+# 6b107f0aadbabc47941c5a5b893b88c01792af6d; releases through 3.32.x were present at
+# verification time. Re-pin (tag AND commit together) each app release -- docs/RELEASING.md.
+# Checksumming is by commit hash: flatpak-builder verifies the git object, which pins content
+# as strongly as a tarball sha256 without depending on tarball stability.
+#
+# ASSUMED until the first Phase 1 build: that this cmake configuration produces a working
+# xfreerdp against the GNOME runtime's libraries (the §12 risk-14 "buildable as a Flatpak
+# module" half -- existence is now verified, buildability is not).
+
+name: freerdp
+buildsystem: cmake-ninja
+config-opts:
+  - -DCMAKE_BUILD_TYPE=Release
+  - -DWITH_SERVER=OFF
+  - -DWITH_SAMPLE=OFF
+  - -DWITH_CLIENT_SDL=OFF # D-20: xfreerdp (X11), not the SDL client
+  - -DWITH_X11=ON
+  - -DWITH_WAYLAND=OFF # sessions run through XWayland on Wayland hosts (§5.6, permanent for Phase 1)
+  - -DWITH_PULSE=ON
+  - -DWITH_WEBVIEW=OFF
+  - -DWITH_FFMPEG=OFF
+sources:
+  - type: git
+    url: https://github.com/FreeRDP/FreeRDP.git
+    tag: '3.30.0'
+    commit: 6b107f0aadbabc47941c5a5b893b88c01792af6d

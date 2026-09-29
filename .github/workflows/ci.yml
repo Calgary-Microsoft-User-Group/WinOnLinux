@@ -61,3 +61,35 @@ jobs:
         run: |
           python -m pip install pip-audit
           python -m pip_audit -r constraints.txt --no-deps
+
+  # Per-commit Flatpak build + install smoke test (add-flatpak-packaging tasks 5.1; design
+  # decision 6). The §13.4 boundary holds: this proves the artifact assembles and installs --
+  # no live-tenant or session tests. This job is also what turns the manifest's ASSUMED facts
+  # (runtime version availability, permission syntax) into continuously verified ones.
+  flatpak:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          # Ubuntu 24.04+ restricts unprivileged user namespaces, which bubblewrap needs.
+          sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Install GNOME runtime
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub org.gnome.Platform//48 org.gnome.Sdk//48
+
+      - name: Build and install the Flatpak
+        run: |
+          flatpak-builder --user --force-clean --install builddir \
+            packaging/flatpak/io.github.CalgaryMicrosoftUserGroup.WinOnLinux.yml
+
+      - name: Install smoke test
+        run: |
+          flatpak info io.github.CalgaryMicrosoftUserGroup.WinOnLinux
+          flatpak info --show-permissions io.github.CalgaryMicrosoftUserGroup.WinOnLinux

@@ -1,0 +1,66 @@
+# Flatpak manifest — primary distribution format (D-3, spec.md §5.8; add-flatpak-packaging).
+#
+# PHASE 0 BUILD: web-only client, FreeRDP module deliberately omitted (the native path is
+# disabled anyway — proposal: "Phase 0 builds may omit the module"). When add-native-launcher
+# lands, append the pinned module from ./freerdp-module.yml to `modules:` below and add the
+# X11 socket decision V2 records (design decision 2).
+#
+# Fact status (repo convention): every permission below restates a §5.8 cost that is DECIDED
+# but UNVERIFIED until Gate STACK V2 runs against a real build of this manifest (tasks 3.x);
+# the GNOME runtime version is ASSUMED-current and CI's build job is what keeps it honest.
+#
+# Network during build: the winonlinux module installs its pinned Python dependencies from
+# PyPI (constraints.txt, D-23) with --share=network — legitimate for CI/repo-hosted builds.
+# A Flathub submission requires vendored (offline) sources instead: generate them with
+# flatpak-pip-generator from the same constraints.txt at that point (docs/RELEASING.md).
+
+app-id: io.github.CalgaryMicrosoftUserGroup.WinOnLinux
+runtime: org.gnome.Platform
+runtime-version: '48'
+sdk: org.gnome.Sdk
+command: winonlinux
+
+finish-args:
+  # Display: shell is Wayland-native; fallback-x11 keeps X11 hosts working. The xfreerdp
+  # child (Phase 1, D-20) is an X11 client -- whether fallback-x11 suffices for a child
+  # process on a Wayland session or a hard --socket=x11 is required is EXACTLY V2 item 3.3;
+  # the conservative pair below is the pre-V2 choice (design decision 2).
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc # X11 MIT-SHM; harmless under pure Wayland
+
+  # All Entra/Graph/feed traffic; proxy exposure inside the sandbox is V2 item 3.4 (§5.9).
+  - --share=network
+
+  # Token cache in the OS keyring via libsecret over the session bus (D-2). If neither this
+  # nor the Secret portal is available the app refuses sign-in -- the §6.3 report-and-refuse
+  # path, verified as V2 item 3.1. No fallback storage exists by design.
+  - --talk-name=org.freedesktop.secrets
+
+  # Audio out / microphone for native sessions (§5.8). PipeWire hosts serve this via the
+  # Pulse compatibility socket.
+  - --socket=pulseaudio
+
+  # DELIBERATELY ABSENT (portals over holes, design decision 3):
+  #  - no --filesystem=... : drive redirection uses per-folder portal grants only (§5.5);
+  #  - no OpenURI permission needed: web launch goes through the OpenURI portal, which is
+  #    mediated per-use (browser choice is the portal's, §10.5);
+  #  - no USB: not grantable under Flatpak -- the recorded reason USB is out of scope (§5.8).
+
+modules:
+  - name: winonlinux
+    buildsystem: simple
+    build-options:
+      build-args:
+        - --share=network # PyPI installs pinned by constraints.txt; see header note
+    build-commands:
+      - pip3 install --prefix=/app --no-cache-dir -c constraints.txt .
+      - install -Dm644 data/io.github.CalgaryMicrosoftUserGroup.WinOnLinux.desktop
+        /app/share/applications/io.github.CalgaryMicrosoftUserGroup.WinOnLinux.desktop
+      - install -Dm644 data/io.github.CalgaryMicrosoftUserGroup.WinOnLinux.metainfo.xml
+        /app/share/metainfo/io.github.CalgaryMicrosoftUserGroup.WinOnLinux.metainfo.xml
+      - install -Dm644 data/icons/hicolor/scalable/apps/io.github.CalgaryMicrosoftUserGroup.WinOnLinux.svg
+        /app/share/icons/hicolor/scalable/apps/io.github.CalgaryMicrosoftUserGroup.WinOnLinux.svg
+    sources:
+      - type: dir
+        path: ../..

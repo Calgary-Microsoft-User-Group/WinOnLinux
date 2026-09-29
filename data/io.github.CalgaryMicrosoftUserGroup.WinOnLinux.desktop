@@ -1,0 +1,12 @@
+[Desktop Entry]
+# Application ID is D-21: fixed by add-app-foundation, consumed verbatim here (never redefined).
+Type=Application
+Name=WinOnLinux
+GenericName=Windows 365 and Azure Virtual Desktop Client
+Comment=Connect to Windows 365 Cloud PCs and Azure Virtual Desktop
+Exec=winonlinux
+Icon=io.github.CalgaryMicrosoftUserGroup.WinOnLinux
+Terminal=false
+Categories=Network;RemoteAccess;GTK;
+Keywords=Windows 365;Cloud PC;AVD;Azure Virtual Desktop;RDP;Remote Desktop;
+StartupNotify=true

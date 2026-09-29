@@ -26,6 +26,11 @@ dependencies = [
     "requests>=2.32.4",
 ]
 
+[project.scripts]
+# The Flatpak manifest's `command:` and the desktop file's Exec= both point here
+# (add-flatpak-packaging change; D-21 application identity).
+winonlinux = "winonlinux.app:main"
+
 [project.optional-dependencies]
 test = [
     "pytest",
