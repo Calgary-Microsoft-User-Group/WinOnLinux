@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "winonlinux"
+version = "0.1.0"
+description = "Linux desktop client for Windows 365 Cloud PCs and Azure Virtual Desktop"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [
+    { name = "Calgary Microsoft User Group" },
+]
+dependencies = [
+    "pygobject",
+    "msal>=1.28.0",
+    "msal-extensions>=1.1.0",
+    # msal itself depends on requests transitively, but winonlinux.auth_manager imports and
+    # catches requests.exceptions.RequestException directly (network-error classification for
+    # FR-4-AC-5's Offline state), so it is declared explicitly here rather than relied on as an
+    # undeclared transitive dependency. Floor 2.32.4 excludes the known-CVE range below it --
+    # CVE-2023-32681 (Proxy-Authorization forwarded cross-host), CVE-2024-35195, and
+    # CVE-2024-47081 (.netrc credential leak via trust_env, the exact proxy-inheritance path
+    # spec.md section 5.9 relies on) -- per D-23 (add-audit-test-coverage, audit F-12).
+    "requests>=2.32.4",
+]
+
+[project.scripts]
+# The Flatpak manifest's `command:` and the desktop file's Exec= both point here
+# (add-flatpak-packaging change; D-21 application identity).
+winonlinux = "winonlinux.app:main"
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/winonlinux"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: fast, hermetic tests with no network, no real tenant, and no display server (CI default)",
+    "live: opt-in tests needing network, a real tenant, or a display server; excluded from CI by default per spec.md section 13.4",
+]
+addopts = "-m unit"

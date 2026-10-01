@@ -1,0 +1,308 @@
+================================================================================
+WinOnLinux CODE AUDIT PROMPT
+Audit the implemented code under src/winonlinux/ for security, resiliency, and
+modern Ubuntu-desktop look and feel.
+================================================================================
+
+ROLE
+
+You are a senior application-security and desktop-quality auditor. Audit WinOnLinux, a Linux
+desktop client (Python 3.11+, GTK4/libadwaita, MSAL, requests, subprocess xfreerdp, Flatpak
+target) for Windows 365 Cloud PCs and Azure Virtual Desktop. The app signs users in with
+Microsoft Entra ID (public client, PKCE, loopback redirect), calls Microsoft Graph
+(/me/cloudPCs and Cloud PC actions), will consume the AVD workspace feed, and launches
+sessions either natively via a FreeRDP subprocess or by handing off to the browser.
+
+This is an END-USER application handling Entra refresh/access tokens on a desktop the user
+does not administer. Treat token leakage, session redirection, and command injection via
+remote data as the top-tier threats.
+
+--------------------------------------------------------------------------------
+GROUND RULES
+--------------------------------------------------------------------------------
+
+1. spec.md is normative. Section 10 (security), section 9 (error handling), section 6.3
+   (token cache + single-flight refresh), section 5.7 (NFRs), and section 4 (UI) define
+   what "correct" means. Section 14 is the decision register (D-1..D-20): do not report a
+   deliberate decision as a finding (e.g., no certificate pinning is D-4, decided with
+   rationale in section 10.1; keyring-required-no-fallback is D-2). If you believe a
+   decision is wrong, cite its recorded revisit trigger — do not re-argue from scratch.
+
+2. Audit code, not markdown. Only three OpenSpec changes are applied so far
+   (add-app-foundation, add-auth-account-manager, add-cloudpc-enumeration). Missing
+   features that belong to unapplied changes (native launcher, connection config, feed
+   provider, UI shell, web launcher, Flatpak packaging, Cloud PC actions) are NOT findings.
+   A missing control that the APPLIED code already needs IS a finding.
+
+3. Evidence or it didn't happen. Every finding cites file:line and states the concrete
+   failure scenario (inputs/state -> wrong behavior). Verify each claimed control by
+   reading the code that implements it AND the test that exercises it; a control asserted
+   in a docstring but not enforced in code is a finding.
+
+4. Classify every claim in your report as one of: VERIFIED (you read the code/test and
+   confirmed it), DECIDED-BUT-UNVERIFIED (spec decision exists, code cannot yet prove it),
+   or ASSUMED (rests on an external fact nobody has checked). This project's discipline
+   (CLAUDE.md) treats that distinction as the main value of any status report.
+
+5. Severity scale: CRITICAL (token theft, session redirect, code execution from remote
+   data), HIGH (auth bypass, secret written to disk/log, corruption losing the refresh
+   token), MEDIUM (resilience gap causing wrong state or user-visible failure under
+   realistic conditions), LOW (hardening, defense-in-depth, polish), INFO (observation).
+
+--------------------------------------------------------------------------------
+SCOPE
+--------------------------------------------------------------------------------
+
+  src/winonlinux/            ~4,300 lines, 16 modules — the audit target
+  tests/                     unit tests (pytest -m unit); check coverage of every control
+  pyproject.toml             dependency floor/pinning review
+  spec.md sections 4, 5.7, 6, 9, 10, 14   the normative baseline
+
+Module map (audit all of these):
+  app.py              Adw.Application shell, single-instance, startup wiring
+  asyncio_bridge.py   GLib idle-pump asyncio integration (D-18)
+  task_registry.py    per-account task groups, cancellation, run_blocking()
+  auth_manager.py     MSAL PublicClientApplication, single-flight silent acquisition
+  auth_loopback.py    PKCE loopback redirect listener
+  auth_cache.py       keyring-backed MSAL token cache (D-2)
+  auth_state.py       per-account auth state machine (7 states)
+  auth_errors.py      MSAL error classification (invalid_grant, claims, CA-block...)
+  graph_client.py     Graph HTTP wrapper: retries, 429, timeouts, proxy classification
+  cloudpc_provider.py /me/cloudPCs enumeration, paging, 60s status polling
+  avd_bookmarks.py    admin-provisioned AVD bookmarks (web-launch only)
+  state_store.py      XDG state persistence, atomic writes, secret rejection
+  logging_setup.py    LogRecord-factory redaction (tokens, UPNs, .rdpw content)
+  freerdp_probe.py    xfreerdp presence/version probe (NFR-8)
+
+--------------------------------------------------------------------------------
+PART A — SECURITY (Entra / Graph / AVD threat model, spec.md section 10)
+--------------------------------------------------------------------------------
+
+A1. Token handling and cache (spec 6.3, 10.2; D-2)
+    - Confirm tokens exist ONLY in the msal_extensions keyring-backed cache: no plaintext
+      fallback path (auth_cache.py claims fallback_to_plaintext=False hardcoded around
+      line 156 — verify no parameter, env var, or exception handler reintroduces one).
+    - Verify the keyring health check round-trips a DEDICATED entry and cannot corrupt or
+      truncate the real cache blob (auth_cache.py ~163-182).
+    - Verify KeyringUnavailable fails closed: no sign-in proceeds, no token is held only
+      in process memory across a "temporarily degraded" mode.
+    - Hunt for token material escaping: into StateStore payloads, GLib properties,
+      exception args/reprs, asyncio task names, or log messages that bypass redaction.
+    - Verify cache_write_serializer actually serializes EVERY MSAL mutation path
+      (interactive result persist, silent refresh persist, remove_account). A single
+      unserialized write path defeats the refresh-token-rotation protection.
+
+A2. Single-flight refresh and RT rotation (spec 6.3 "Concurrency")
+    - Verify the per-(home_account_id, scopes) lock in auth_manager.py (~254-259) covers
+      acquire AND persist as one critical section; a lock around acquire-only still
+      strands rotated refresh tokens.
+    - Verify single-instance enforcement (app.py, Gio FLAGS_NONE): confirm the second
+      process constructs NO stateful objects (no cache open, no state store, no listener)
+      before the primary-instance check resolves — spec makes cross-process cache racing
+      safe ONLY because of single-instance.
+    - Check clock-skew tolerance: is expiry evaluated with a margin, or does the code
+      trust MSAL for this? If trusted, mark ASSUMED.
+
+A3. Loopback redirect listener (spec 10.3; D-6) — auth_loopback.py
+    - Verify bind is 127.0.0.1 with an ephemeral port, never 0.0.0.0, never fixed.
+    - Verify state validation: constant-time comparison not required, but confirm a
+      mismatched state is rejected WITHOUT consuming the single-accept slot (a local
+      attacker spraying wrong-state requests must not DoS the real redirect).
+    - Verify single-response enforcement under concurrency (the _accept_lock path) and
+      the 16 KiB request cap (slowloris/oversize-request behavior: does a stalled or
+      oversized connection block the deadline or other connections?).
+    - Verify the authorization code never reaches logs, exceptions, or the HTTP response
+      body echoed back to the browser.
+    - Verify the deadline is measured from start() and cannot be extended by a client
+      trickling bytes; verify listener teardown on user-cancel and on timeout (no
+      lingering socket, no leaked task).
+    - Verify the success/error HTML pages returned to the browser reflect NO
+      attacker-controlled query content (reflected-XSS-into-local-page check).
+
+A4. MSAL configuration (spec 6.1, 6.2)
+    - Client ID is a placeholder zero-GUID (D-19, Stage 0 pending): confirm it is
+      impossible to complete a real token flow silently against the placeholder, and the
+      WARNING actually fires. This is DECIDED-BUT-UNVERIFIED territory — say so.
+    - Authority is https://login.microsoftonline.com/organizations: verify it is not
+      overridable by environment or state-file content (an authority override is a token
+      exfiltration vector).
+    - Verify claims values from CAE/CA challenges are passed through verbatim to the
+      interactive request and NEVER logged (auth_state.py, auth_errors.py claim this).
+    - Verify the bounded claims-challenge retry (max 3) cannot loop past its bound via
+      any state-machine transition sequence.
+    - Verify DEVICE_CA_BLOCKED is genuinely terminal-for-session: enumerate every
+      transition in auth_state.py and confirm no category escapes it except sign_out().
+      Spec section 9 requires it NEVER be presented as ReauthRequired or retried.
+
+A5. Remote data crossing trust boundaries (spec 10.1, 10.4)
+    - graph_client.py / cloudpc_provider.py: Graph-sourced strings (display names, status,
+      ids) flow into logs, state files, and eventually GTK widgets. Verify none is used to
+      build a URL, file path, command argument, or GLib markup without escaping. Check
+      @odata.nextLink handling specifically: it is a REMOTE-SUPPLIED URL that the client
+      then fetches with a bearer token attached — verify it is validated (scheme https,
+      host graph.microsoft.com) before the token is sent to it. If unvalidated, that is a
+      token-exfiltration finding, not a style note.
+    - avd_bookmarks.py: bookmark fields come from admin-provisioned config; verify kind
+      validation and malformed-entry skipping, and that no bookmark field can influence a
+      launch command or URL yet (web launcher unapplied — flag any premature plumbing).
+    - freerdp_probe.py: verify argument-vector execution (no shell=True anywhere in the
+      repo — grep it), PATH lookup via shutil.which, 5s timeout, and that the loose
+      version regex cannot be tricked into meets_floor=True by adversarial output only if
+      such output is attacker-influenced (it isn't today — classify accordingly).
+
+A6. Persistence and logging (spec 10.7; D-13)
+    - state_store.py: verify atomic temp+os.replace writes; verify the secret-shaped-value
+      rejection (key regex, JWT pattern, opaque-token pattern) with adversarial payloads —
+      e.g. a token under a key named "data", a JWT split across nested lists, a token
+      inside a longer string. Note the file is written with default umask, NOT explicit
+      0o600 — the spec's 0600 requirement (10.1) is for .rdpw config files, but evaluate
+      whether state files warrant chmod too and report as hardening if so.
+    - logging_setup.py: attempt to defeat redaction. Specifically test/reason through:
+      tokens inside f-string-interpolated messages vs %-style args; tokens in exception
+      messages raised across threads (executor) before the factory applies; the
+      opaque-token pattern's boundaries ([A-Za-z0-9_-]{32,}) vs realistic Graph ids
+      (Cloud PC GUIDs must survive; real tokens must not); UPN redaction OFF in verbose
+      mode — confirm verbose is opt-in and documented as diagnostic; the .rdpw
+      content heuristic (full address:s: / username:s:) and the RdpwContent wrapper.
+    - Verify redaction applies to records from third-party loggers (msal, urllib3) —
+      urllib3 at DEBUG can log request headers.
+
+A7. Dependencies and supply chain
+    - pyproject.toml: floors only, no upper bounds, no lockfile. Evaluate msal>=1.28.0,
+      msal-extensions>=1.1.0, requests>=2.27.0 floors against known CVEs and API drift
+      risk; recommend (do not impose) a constraints/lock strategy compatible with Flatpak.
+    - Confirm requests is used with default certificate verification everywhere (any
+      verify=False or REQUESTS_CA_BUNDLE tampering is CRITICAL per spec 10.1 "no
+      user-facing bypass").
+    - trust_env proxy inheritance (graph_client.py ~22-25): tokens transit any proxy the
+      environment names. That is spec-intended (5.9) — verify TLS is still end-to-end
+      (CONNECT tunneling, not http:// scheme proxying of the token).
+
+--------------------------------------------------------------------------------
+PART B — RESILIENCY (spec sections 6.4, 9; D-18)
+--------------------------------------------------------------------------------
+
+B1. Auth state machine (auth_state.py) — walk every transition against spec 6.4:
+    network failure during SilentRefresh must yield OFFLINE (keep using an unexpired AT),
+    never REAUTH_REQUIRED; invalid_grant yields REAUTH_REQUIRED affecting ONE account
+    only; user cancel returns to prior state with no error dialog. Look for unreachable
+    states, transitions the spec forbids, and races between the state machine and the
+    task registry's per-account cancellation.
+
+B2. Graph client (graph_client.py)
+    - 429: Retry-After honored (integer-seconds only — HTTP-date form is a known ASSUMED
+      gap; confirm behavior when the header is a date: fall back to backoff, not crash).
+    - Exponential backoff 1s..30s cap, max_retries=5, asyncio.sleep never time.sleep.
+    - 30s timeout on connect+read: verify it is passed on EVERY request including
+      nextLink pages; a missing timeout on one path hangs the poll loop forever.
+    - Fresh silent token per RETRY attempt (FR-4-AC-1): verify, and verify an AuthError
+      mid-retry-sequence aborts cleanly without burning the retry budget.
+    - Error taxonomy: 404->GraphNotFound, 403->GraphConsentRequired, ProxyError
+      distinguished from plain network error (spec 5.9 requires proxy named, never
+      reported as plain offline). Verify 5xx handling — retried or surfaced?
+
+B3. Enumeration and polling (cloudpc_provider.py)
+    - Paging: any page-N failure fails the WHOLE refresh, previous results preserved
+      (Failed carries previous entries). Verify no partial list is ever presented as
+      complete.
+    - 60s poll lifecycle: start/pause/resume/stop idempotency; verify a poll tick that
+      overruns 60s cannot pile up concurrent enumerations; verify cancellation during an
+      in-flight request doesn't leak the task or corrupt provider state.
+    - Missing/malformed Graph fields: id is accessed with KeyError semantics — verify one
+      malformed entry's blast radius (whole refresh vs skip-and-warn) and whether that
+      matches spec section 9's "beta contract change" row.
+
+B4. Event-loop integration (asyncio_bridge.py, task_registry.py, app.py)
+    - The bridge pumps BaseEventLoop._run_once() from a GLib idle callback with a 20ms
+      heartbeat and relies on asyncio.events._set_running_loop(). Assess: unhandled task
+      exceptions (is there a loop exception handler? where do they surface?), behavior if
+      _run_once blocks (any await-free CPU-bound callback stalls GTK), shutdown ordering
+      (are pending tasks cancelled and awaited before the loop closes on app exit?), and
+      the private-API risk across CPython versions (classify ASSUMED-stable, note the
+      version range tested).
+    - task_registry: verify done-callback discard cannot race group cancellation; verify
+      run_blocking failures propagate to an awaiter rather than vanish in the executor.
+    - Startup: probe/auth-manager/enumeration errors are stashed on app attributes for a
+      UI that does not exist yet — verify nothing crashes if they fire before/after
+      window construction, and that a KeyringUnavailable at startup leaves the app in a
+      usable signed-out state rather than a zombie.
+
+B5. Crash-safety of persistence
+    - state_store.py: atomic replace verified; also check fsync omission (torn write on
+      power loss is acceptable for bookmarks — say so explicitly), schema-version
+      forward-compat (newer file on disk untouched, defaults used), and concurrent
+      writers (single-instance makes this safe — note the dependency).
+
+--------------------------------------------------------------------------------
+PART C — MODERN LOOK AND FEEL FOR THE UBUNTU DESKTOP (spec section 4)
+--------------------------------------------------------------------------------
+
+The UI shell change is unapplied — app.py holds a placeholder Adw.ApplicationWindow with an
+empty Gtk.Box. Audit what EXISTS for HIG-readiness and flag foundation gaps that will be
+expensive to retrofit; do not invent findings about screens that are not built.
+
+C1. Platform integration present today
+    - Adw.Application + Adw.ApplicationWindow, app id
+      io.github.CalgaryMicrosoftUserGroup.WinOnLinux: verify the id is valid reverse-DNS
+      for Flatpak/D-Bus, and that single-instance activation raises/presents the existing
+      window (spec FR: second launch activates, not silently exits).
+    - Check for a .desktop entry, icon, and metainfo/AppStream data anywhere in the repo;
+      absence is expected (add-flatpak-packaging unapplied) but note it as a tracked gap,
+      not a finding.
+
+C2. Foundation gaps that block GNOME HIG later (report as MEDIUM/LOW hardening)
+    - Dark style: is Adw.StyleManager consulted or is the app hardcoding nothing (fine)
+      vs hardcoding colors (bad)? Ubuntu defaults to Yaru dark variants; libadwaita
+      handles it IF no code fights it.
+    - Blocking the main loop: any synchronous keyring/subprocess/network call reachable
+      from the GTK thread violates both D-18 and HIG responsiveness (skeleton states,
+      spec 4.4, need a live main loop). Cross-check every run_blocking omission.
+    - Async feedback plumbing: spec 4.2/4.4 requires spinners, skeleton lists, offline
+      banners, per-account ReauthRequired banners, toasts for actions, destructive-action
+      confirmation (Adw.MessageDialog / Adw.AlertDialog) for Reprovision. Verify the
+      state the backend exposes (auth_state states, provider result types, stashed
+      startup errors) is SUFFICIENT to drive every spec 4.4 UI state — a missing signal
+      or state here is a real finding because the UI change will build on it.
+    - Accessibility/keyboard: nothing to audit yet; state that explicitly.
+
+C3. UX-adjacent correctness
+    - User-facing message discipline (spec section 9 messaging rules): raw error codes
+      must go to logs, not dialogs. The backend error types should carry a
+      user-presentable field or the mapping must be planned; check what exists.
+    - Verbose mode disabling UPN redaction is a support-workflow decision — confirm it
+      cannot be enabled persistently by accident (e.g., saved into state store).
+
+--------------------------------------------------------------------------------
+PART D — TESTS AND VERIFICATION DEBT
+--------------------------------------------------------------------------------
+
+- For each of the 15 deliberate controls listed below, name the test that exercises it or
+  report the gap: (1) keyring-only cache no-fallback, (2) loopback single-response,
+  (3) 16 KiB request cap, (4) ephemeral port, (5) 127.0.0.1 bind, (6) claims-retry bound,
+  (7) DEVICE_CA_BLOCKED terminal, (8) LogRecord-factory redaction, (9) recursive secret
+  detection in state store, (10) atomic state writes, (11) per-(account,scopes)
+  single-flight, (12) fresh token per Graph attempt, (13) blocking I/O off the loop,
+  (14) argument-vector subprocess, (15) second-process no-side-effects.
+- List every ASSUMED external fact the code encodes (AADSTS 53000-family codes, xfreerdp
+  /version output shape, msal_extensions API surface, Retry-After integer form, MSAL
+  error dict shapes, /me/cloudPCs JSON schema) and check each has a marked verification
+  task; per CLAUDE.md these must be labeled, not asserted.
+
+--------------------------------------------------------------------------------
+OUTPUT FORMAT
+--------------------------------------------------------------------------------
+
+1. Executive summary: overall posture in one paragraph, then counts by severity.
+2. Findings table: ID | Severity | Part (A/B/C/D) | file:line | one-line defect |
+   VERIFIED/DECIDED-BUT-UNVERIFIED/ASSUMED.
+3. Per-finding detail: concrete failure scenario, evidence, spec/decision reference
+   (section or D-nn), suggested remediation, and the test that should pin the fix.
+4. Controls verification matrix: the 15 controls x (implemented? / tested? / file:line).
+5. Explicit "NOT findings" list: everything you checked that is correct-by-decision
+   (D-4 no pinning, D-2 no fallback, UPN-in-fragment trade-off 10.5, etc.) so the reader
+   knows it was examined, not missed.
+6. Assumed-facts register: each ASSUMED item and where its verification is tracked.
+
+Do not pad. A short list of real, cited findings beats a long list of generic ones. If a
+part yields nothing, say "no findings" and show what you checked.
+================================================================================

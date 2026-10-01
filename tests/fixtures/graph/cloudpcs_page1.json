@@ -1,0 +1,26 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('11111111-2222-3333-4444-555555555555')/cloudPCs",
+  "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/cloudPCs?$skiptoken=FIXTURE_ONLY_PLACEHOLDER_PAGE_2_TOKEN",
+  "value": [
+    {
+      "id": "11111111-1111-1111-1111-111111111111",
+      "displayName": "Kevin's Cloud PC",
+      "status": "provisioned",
+      "provisioningType": "dedicated",
+      "imageDisplayName": "Windows 11 Enterprise + Microsoft 365 Apps",
+      "managedDeviceName": "CPC-KKAMINSK-01",
+      "servicePlanName": "Windows 365 Enterprise 4 vCPU/16 GB/128 GB",
+      "userPrincipalName": "kevin@example.onmicrosoft.com"
+    },
+    {
+      "id": "22222222-2222-2222-2222-222222222222",
+      "displayName": "Dev Box - Engineering",
+      "status": "provisioning",
+      "provisioningType": "dedicated",
+      "imageDisplayName": "Windows 11 Enterprise",
+      "managedDeviceName": "CPC-DEVBOX-02",
+      "servicePlanName": "Windows 365 Enterprise 8 vCPU/32 GB/256 GB",
+      "userPrincipalName": "kevin@example.onmicrosoft.com"
+    }
+  ]
+}

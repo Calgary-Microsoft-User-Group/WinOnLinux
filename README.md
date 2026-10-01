@@ -3,8 +3,10 @@
 A Linux desktop client for **Windows 365 Cloud PCs** and **Azure Virtual Desktop** — analogous to Microsoft's
 Windows App, which is not available for Linux.
 
-> **Status:** specification complete, implementation not started. No application code exists yet. The next step is a
-> **5-working-day feasibility sprint** whose first three days answer the question the whole project depends on.
+> **Status:** Phase 0 (web-only client) is **feature-complete in code**: sign-in, enumeration, web launch, and
+> Cloud PC management actions, with a Flatpak manifest and per-commit CI builds. Live-tenant verification and the
+> native path wait on the **5-working-day feasibility sprint** whose first three days answer the question the
+> whole project depends on.
 
 ## Planned capabilities
 
@@ -67,6 +69,17 @@ Broker-based support for device-Conditional-Access tenants is committed and sche
 
 These are deliberate, recorded decisions rather than gaps to be discovered later:
 
+- **A system keyring is required — there is no fallback.** Sign-in tokens are stored only in the OS keyring
+  (Secret Service; the portal under Flatpak). If no usable keyring is present, the app refuses sign-in with an
+  explanation rather than storing tokens less safely (spec.md D-2). This is deliberate and load-bearing.
+- **Proxy support follows the environment.** Traffic honors `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and desktop
+  proxy settings; proxy failures are reported as proxy failures, never as plain "offline" (spec.md §5.9). PAC
+  files and authenticated proxies are deferred — not yet supported.
+- **Web launches place your sign-in name (UPN) in the URL fragment.** Launch URLs end with
+  `#loginHint=<your UPN>` so the browser lands on the right account without an account picker. The fragment is
+  never transmitted in the HTTP request (spec.md §10.5), but it **does enter your browser history** — anyone able
+  to read that history can see which account launched a session. This is the recorded §10.5 trade-off; clear
+  browser history if that matters in your environment.
 - **Tenant admin consent is mandatory.** Both Cloud PC Graph scopes are delegated-and-admin-consent-only. The app is
   unusable in a tenant until an admin approves. Personal Microsoft accounts are not supported at all.
 - **Tenants enforcing device-based Conditional Access are not supported** until broker integration lands. An
@@ -86,7 +99,7 @@ These are deliberate, recorded decisions rather than gaps to be discovered later
   introduction for technical and non-technical stakeholders: what we are building, why the gap exists, and what the
   five-day sprint does and does not buy.
 - **[spec.md](spec.md)** — the full product and architecture specification, and the authoritative source. §14 is a
-  **decision register**: 20 decisions, each with rationale and a revisit trigger.
+  **decision register**: 23 decisions, each with rationale and a revisit trigger.
 - **[projectmanagement/projectplan.md](projectmanagement/projectplan.md)** — the 5-working-day feasibility sprint:
   entry conditions, the day-by-day plan, the gates, and the branch point at the end of day 3.
 - **[gapsandrecommendations.md](gapsandrecommendations.md)** — assessment of specification completeness and

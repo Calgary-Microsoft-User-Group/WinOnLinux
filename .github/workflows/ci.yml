@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every CPython minor the project declares support for (requires-python >=3.11): the
+        # asyncio-bridge private-API dependence and every asyncio primitive's loop affinity are
+        # continuously verified across this range instead of assumed (add-audit-test-coverage,
+        # audit F-09/F-22; the 3.12 serializer failure the 2026-09-22 audit found was invisible
+        # to a 3.11-only CI).
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # System packages needed for PyGObject's pip build and GTK4/libadwaita imports: cairo dev
+      # headers (PyGObject's build pulls pycairo, whose meson build needs cairo.pc -- absence of
+      # libcairo2-dev is why every CI run before add-audit-test-coverage failed at install),
+      # girepository dev headers for both the 1.0 and 2.0 API (PyGObject >= 3.52 builds against
+      # girepository-2.0), GI typelibs for Gtk 4 and Adw 1, and python3-gi as a fallback. No
+      # display server (xvfb) on purpose: unit tests must not need one per spec.md section 13.4.
+      - name: Install PyGObject build deps and GI typelibs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libcairo2-dev \
+            pkg-config \
+            libgirepository1.0-dev \
+            libgirepository-2.0-dev \
+            gir1.2-gtk-4.0 \
+            gir1.2-adw-1 \
+            python3-gi
+
+      # constraints.txt pins the full resolved pip set (D-23): the tested set and the shipped
+      # set are one artifact -- the future Flatpak manifest consumes the same file.
+      - name: Install project with test extras (pinned)
+        run: python -m pip install -e ".[test]" -c constraints.txt
+
+      - name: Run tests
+        run: python -m pytest
+
+      # Report-only for now (promote to blocking once it has been quiet for a while --
+      # add-audit-test-coverage tasks.md 3.3): flags CVEs that appear in the pinned set
+      # between deliberate constraints regenerations.
+      - name: Audit pinned dependencies for known CVEs
+        continue-on-error: true
+        run: |
+          python -m pip install pip-audit
+          python -m pip_audit -r constraints.txt --no-deps
+
+  # Per-commit Flatpak build + install smoke test (add-flatpak-packaging tasks 5.1; design
+  # decision 6). The §13.4 boundary holds: this proves the artifact assembles and installs --
+  # no live-tenant or session tests. This job is also what turns the manifest's ASSUMED facts
+  # (runtime version availability, permission syntax) into continuously verified ones.
+  flatpak:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          # Ubuntu 24.04+ restricts unprivileged user namespaces, which bubblewrap needs.
+          sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Install GNOME runtime
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub org.gnome.Platform//48 org.gnome.Sdk//48
+
+      - name: Build and install the Flatpak
+        run: |
+          flatpak-builder --user --force-clean --install builddir \
+            packaging/flatpak/io.github.CalgaryMicrosoftUserGroup.WinOnLinux.yml
+
+      - name: Install smoke test
+        run: |
+          flatpak info io.github.CalgaryMicrosoftUserGroup.WinOnLinux
+          flatpak info --show-permissions io.github.CalgaryMicrosoftUserGroup.WinOnLinux

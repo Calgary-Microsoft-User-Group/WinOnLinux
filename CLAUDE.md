@@ -4,25 +4,56 @@ Guidance for Claude Code working in this repository.
 
 ## What this repo is
 
-A **specification-only** repository for WinOnLinux — a Linux desktop client for Windows 365 Cloud PCs and
-Azure Virtual Desktop. There is **no application code yet**, and no build, test, or lint commands to run. Work here
-is document work: specifying, deciding, and recording.
+WinOnLinux — a Linux desktop client for Windows 365 Cloud PCs and Azure Virtual Desktop. The repo started as
+**specification-only** and is now a **live coding repo**. As of 2026-09-27, **every non-gated OpenSpec change is
+implemented**: the three foundations (`add-app-foundation`, `add-auth-account-manager`, `add-cloudpc-enumeration`,
+applied and still active in `openspec/changes/`) plus `add-ui-shell`, `add-web-launcher`, and
+`add-cloudpc-actions` (implemented and archived), alongside the six 2026-09-22 audit-remediation changes
+(`codeaudit/2026-09-22.md` — all 26 findings closed), all under `openspec/changes/archive/2026-09-27-*`. The app
+signs in, enumerates Cloud PCs, launches web sessions, and invokes Cloud PC management actions end to end —
+and every commit builds an **installable Phase 0 Flatpak artifact** in CI (`add-flatpak-packaging`'s ungated
+web-only half landed 2026-09-29: manifest, desktop/AppStream data, per-commit build job; its Gate STACK V2
+evidence, deb/rpm, and channel decision remain open on BIG-286). The three fully gated changes
+(`add-avd-feed-provider`, `add-connection-config-provider`, `add-native-launcher`) are **blocked on Stage 0/1
+and LG-1** — their gate-precondition checks were run 2026-09-29 and fail (no Stage 0 finding, no LG-1 position,
+no Stage 1 schema/fixtures); per D-14 that is a stop, not a workaround. Outstanding M/I-level live-tenant/desktop
+verifications from the archived feature changes are collected in Linear **BIG-345** (blocked on the D-19 app
+registration; nothing signs in for real against the placeholder client ID).
+
+Build/test commands: `python -m pytest` runs the unit suite (~300 tests, `-m unit` is the default; hermetic, no
+display server; a `gi` stub in `tests/conftest.py` covers the GTK-importing modules headlessly). CI
+(`.github/workflows/ci.yml`) runs it on Python 3.11/3.12/3.13 with the pinned `constraints.txt` set (D-23) plus a
+report-only `pip-audit`. `spec.md` stays normative for requirements and decisions throughout; OpenSpec changes
+implement it, they don't replace it as the source of truth.
 
 ```
 spec.md                   The specification. §14 is the decision register — authoritative.
 gapsandrecommendations.md  Completeness/feasibility assessment: 54 findings (G-nn), applied + backlog.
 README.md                  Public-facing summary.
+src/winonlinux/            The application (21 modules): auth, Graph, providers, launchers, actions, GTK shell.
+tests/                     Unit suite (~300 tests, pytest -m unit; gi stub in conftest for headless CI).
+constraints.txt            Pinned dependency set (D-23) — CI installs with it; Flatpak will consume it.
+codeaudit/2026-09-22.md    The code audit: 26 findings, controls matrix, assumed-facts register. All closed.
+packaging/flatpak/         Flatpak manifest (Phase 0, web-only) + the pinned Phase 1 FreeRDP module.
+data/                      Desktop file, AppStream metainfo, icon — all under the D-21 application ID.
+docs/RELEASING.md          Release checklist: FreeRDP re-pin, constraints regeneration, channel decision.
+openspec/changes/*/        Remaining OpenSpec change proposals (see above); archive/ holds completed ones.
 docs/superpowers/specs/2026-08-18-...-design.md
                            Original native-path design. Partly superseded by spec.md.
 ```
 
-Execution is tracked in **Linear**, deliberately split three ways:
+Execution is tracked in **Linear** — team `BigHatGroup` (workspace `linear.app/bighatgroup`), deliberately split four ways:
 
-| Project | Holds | Do not put |
+| Project (real Linear name) | Holds | Do not put |
 | --- | --- | --- |
-| Prerequisites | Tenant, licence, hardware, tooling procurement (E-1…E-11) | Spec or code work |
-| Implementation | Open specification and decision gaps (G-nn) | Procurement or execution |
-| Sprint 1 | The 5-day feasibility sprint (S-0…S-7, V3, LG-1) | Anything beyond the sprint |
+| `WindowsAppforLinuxPrereq` | Tenant, licence, hardware, tooling procurement (E-1…E-11) | Spec or code work |
+| `WindowsAppForLinuxImpl` | Open specification and decision gaps (G-nn) | Procurement or execution |
+| `WindowsAppForLinuxSprint1` | The 5-day feasibility sprint (S-0…S-7, V3, LG-1) | Anything beyond the sprint |
+| `WinOnLinuxCode` | Application code, one issue per OpenSpec change under `openspec/changes/` (10 original + 6 audit-remediation issues BIG-337…BIG-342, the latter all Done); ordering enforced by Linear blocking relations, Phase 1 issues titled `(GATED: Stage 0/1, LG-1)`. BIG-287/BIG-273/BIG-274 are Done; their outstanding live-tenant/desktop verifications are collected in BIG-345 | Spec/decision gaps or procurement |
+
+Older references to "Prerequisites", "Implementation", and "Sprint 1" project names elsewhere (including earlier in this file's history) mean
+`WindowsAppforLinuxPrereq`, `WindowsAppForLinuxImpl`, and `WindowsAppForLinuxSprint1` respectively — those are the actual Linear project
+names to use when searching, filtering, or linking issues.
 
 ## The five technical facts most easily got wrong
 
@@ -42,11 +73,12 @@ Execution is tracked in **Linear**, deliberately split three ways:
 
 ## Working conventions
 
-**The decision register (`spec.md` §14) is normative.** Twenty decisions, D-1…D-20, each with rationale and a revisit
-trigger. Before proposing an architectural change, check whether it is already decided — and if you want to reverse
-one, cite its revisit trigger rather than re-arguing from scratch. Decided so far: subprocess FreeRDP (D-1), keyring
-required with no file fallback (D-2), Flatpak (D-3), no certificate pinning (D-4), in-session config caching (D-5),
-Python 3 + GTK4 (D-16), MSAL Python (D-17), asyncio (D-18), `xfreerdp` (D-20).
+**The decision register (`spec.md` §14) is normative.** Twenty-three decisions, D-1…D-23, each with rationale and a
+revisit trigger. Before proposing an architectural change, check whether it is already decided — and if you want to
+reverse one, cite its revisit trigger rather than re-arguing from scratch. Decided so far: subprocess FreeRDP (D-1),
+keyring required with no file fallback (D-2), Flatpak (D-3), no certificate pinning (D-4), in-session config caching
+(D-5), Python 3 + GTK4 (D-16), MSAL Python (D-17), asyncio (D-18), `xfreerdp` (D-20), the application ID (D-21), a
+single FreeRDP probe (D-22), and constraints-file dependency pinning (D-23).
 
 **Record decisions, don't just make them.** A new decision gets an ID, a one-line rationale, and a revisit trigger, in
 the §14 table. This is what makes reversal a deliberate act rather than drift.
@@ -69,7 +101,9 @@ awk 'BEGIN{t=0} /^\|/{n=gsub(/\|/,"|"); if(!t){t=1;h=n} else if(n!=h) print "COL
 
 This problem space has changed repeatedly and much of the research **postdates mid-2026**. Several load-bearing claims
 are dated July–August 2026: the removal of the web client's `.rdpw` download, Microsoft's Q&A answer that no public API
-exists, FreeRDP 3.30.0's contents, the first-party AVD client ID and feed scope, `arm.c`'s signature handling.
+exists, FreeRDP 3.30.0's contents (its **existence** was verified against upstream 2026-09-29 — tag + commit pinned in
+`packaging/flatpak/freerdp-module.yml`; contents/buildability remain open), the first-party AVD client ID and feed
+scope, `arm.c`'s signature handling.
 
 When these come up, mark them as needing verification rather than stating them as current fact. `spec.md` §12 risk 14
 lists them; re-verification is the first task of Stage 0. The same applies to FreeRDP flag names (§5.5) — verify

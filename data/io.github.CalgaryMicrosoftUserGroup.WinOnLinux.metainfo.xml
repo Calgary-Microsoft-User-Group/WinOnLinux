@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata (add-flatpak-packaging, tasks 1.2). The component id is D-21's
+     application ID, imported in spirit from winonlinux.app.APPLICATION_ID and pinned by
+     tests/test_packaging_data.py so the two can never drift. -->
+<component type="desktop-application">
+  <id>io.github.CalgaryMicrosoftUserGroup.WinOnLinux</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>WinOnLinux</name>
+  <summary>Connect to Windows 365 Cloud PCs and Azure Virtual Desktop</summary>
+  <description>
+    <p>
+      WinOnLinux is a Linux desktop client for Windows 365 Cloud PCs and Azure Virtual
+      Desktop. Sign in with your Microsoft Entra ID work account, see your Cloud PCs and AVD
+      resources in one place, and connect through the browser-based web client. Cloud PC
+      management actions (restart, rename, troubleshoot, reset) are built in.
+    </p>
+    <p>
+      Native (FreeRDP-based) sessions are planned; this release connects via the web client.
+      A system keyring is required for secure sign-in storage.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.CalgaryMicrosoftUserGroup.WinOnLinux.desktop</launchable>
+  <developer_name>Calgary Microsoft User Group</developer_name>
+  <url type="homepage">https://github.com/Calgary-Microsoft-User-Group/WinOnLinux</url>
+  <url type="bugtracker">https://github.com/Calgary-Microsoft-User-Group/WinOnLinux/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-09-29">
+      <description>
+        <p>Phase 0: sign-in, Cloud PC and AVD bookmark enumeration, web launch, Cloud PC
+           management actions.</p>
+      </description>
+    </release>
+  </releases>
+  <categories>
+    <category>Network</category>
+    <category>RemoteAccess</category>
+  </categories>
+</component>

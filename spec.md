@@ -985,7 +985,8 @@ Consequences:
 | Auth | Feed token rejected (`401` at feed) despite successful issuance | Treat as identity-model failure, not expiry: `Unavailable(reason)` to the launcher, native disabled with reason, web fallback offered; log the audience actually issued |
 | Graph | `403` insufficient privileges / consent missing | Guided admin-consent flow: explain that a tenant admin must approve, show the admin-consent URL for forwarding |
 | Graph | `404` on `/me/cloudPCs` (no license/assignment) | Empty state: "No Cloud PC is assigned to this account" |
-| Graph | `429` throttled | Honor `Retry-After`; exponential backoff; no user-visible error unless persistent |
+| Graph | `429` throttled | Honor `Retry-After` (clamped to a 300 s ceiling — an oversized header must not park a refresh); exponential backoff otherwise; no user-visible error unless persistent |
+| Graph | Transient `5xx` (`502`/`503`/`504`) | Retried within the same backoff budget as `429`; `500` surfaces immediately (server bug, not transience). Amended by the fix-graph-hardening change (2026-09-25, audit F-16/F-17) |
 | Graph | Beta contract change (unexpected shape) | Disable affected action with "Microsoft API change" message; log for triage |
 | Feed | Discovery/download failure | AVD section shows inline error + retry; Cloud PC section unaffected |
 | Config | **Field validation failure** (host outside the allowlist, malformed value) | Reject the configuration; report as a **security** error, not a connection error; no session attempted; retry does not re-offer the same config (section 10.1) |
@@ -1032,7 +1033,9 @@ Required controls:
   only if Microsoft publishes a stable pin set, or if a same-CA feed-tampering incident is observed in practice.
 - **Allowlist validation of every host-shaped field** returned by the feed, against expected Microsoft domain
   suffixes, **before** it is written into a configuration. A value outside the allowlist is a security error
-  (section 9), not a connection error, and the composed file is discarded.
+  (section 9), not a connection error, and the composed file is discarded. The same principle applies to
+  remote-supplied fetch targets: Graph paging URLs (`@odata.nextLink`) are validated (scheme `https`, host exactly
+  `graph.microsoft.com`) before any bearer token is attached (fix-graph-hardening change, audit F-01).
 - **Type and shape validation of every other field** consumed from the feed; unknown fields are dropped rather than
   passed through, so the feed cannot inject configuration this client has not reasoned about.
 - **Handoff hygiene**: the composed configuration is written to a file with `0600` permissions in a user-private
@@ -1299,6 +1302,19 @@ Verification codes: **U** unit/fixture · **I** integration against a live tenan
     client ID and feed scope values; and the `getCloudPcLaunchInfo` hard stop of 2026-10-30. **Re-verify all of them
     as the first task of Stage 0**, since the plan's shape depends on them. A volatile-facts register with owners and
     review dates is outstanding work.
+15. **MSAL cached-token semantics are assumed, not verified.** The §6.4 Offline path ("keep using an unexpired
+    cached AT") is delegated entirely to MSAL Python: the code assumes `acquire_token_silent*` serves a cached,
+    unexpired access token with zero network and applies its own expiry/clock-skew buffer. Recorded here
+    (fix-account-lifecycle change, 2026-09-25, audit F-18/A-10) so it is verified alongside V1's `msal-extensions`
+    check rather than trusted silently — if MSAL ever attempts proactive refresh and raises on network failure, a
+    valid cached AT could exist while the client reports Offline.
+16. **Private CPython internals the event-loop bridge depends on are now CI-verified, not assumed.**
+    `BaseEventLoop._run_once`, `asyncio.events._set_running_loop`, and the daemon-executor thread-spawn override
+    in `asyncio_bridge` are underscore-API dependencies with no compatibility contract. As of the
+    add-audit-test-coverage change (2026-09-27), CI runs the unit suite on every supported CPython minor
+    (3.11–3.13), so a breaking change in any of them fails CI before a release rather than surfacing in an audit
+    or in the field. The `Retry-After` integer-seconds assumption (§9) is likewise now pinned: the HTTP-date form's
+    fall-back-to-backoff behavior has a dedicated test rather than a docstring note.
 
 ---
 
@@ -1388,6 +1404,9 @@ reversing one is a deliberate act with a stated cause rather than a drift.
 | **D-17** | **MSAL Python**, with `msal-extensions` for the persisted cache | Follows from D-16. `msal-extensions` supplies a keyring-backed cache with cross-process locking — the one place a library answers §6.3's concurrency requirement instead of the application writing it. Reimplementing token refresh is a bad place to be original | Its current Linux/libsecret behavior fails verification, in which case the application supplies single-flight and locking itself as §6.3 already requires |
 | **D-20** | The native launcher runs **`xfreerdp`**, FreeRDP's X11 client (§5.6) | More mature than the SDL client and the richest redirection support, which matters because §5.5's channel set is the user-visible half of the product. SDL's advantage is a native-Wayland path, and §5.6 defers native Wayland — so that advantage buys nothing in Phase 1 while costing maturity now. The engine itself was never open: D-1 and §5.2 record FreeRDP as the only open-source stack with working AVD ARM-gateway support | Native Wayland becomes a Phase 1+ target, or `xfreerdp` proves deficient on a §5.5 channel the product needs — in either case the migration is to the SDL client, not to a different engine |
 | **D-18** | **Single asyncio event loop**; per-account task groups keyed by home account ID; blocking keyring and subprocess calls in a thread executor | Follows from D-16. Task groups give FR-3-AC-2's cancellation-on-account-switch directly, and a per-account lock plus shared in-flight future gives §6.3 single-flight. GTK application uniqueness supplies FR-4-AC-7 nearly free | Cancellation proves insufficient for in-flight Graph actions rather than just enumeration |
+| **D-21** | The **application ID** (`io.github.CalgaryMicrosoftUserGroup.WinOnLinux`) is fixed and owned by `add-app-foundation` — it is the GApplication ID (FR-4-AC-7 uniqueness) from the first commit, and `add-flatpak-packaging` consumes the same constant rather than choosing its own | The OpenSpec proposal review (2026-09-14) found `add-app-foundation` and `add-flatpak-packaging` each reading as if it originated this identifier, with no task in either reconciling order. app-foundation needs a concrete value to implement GTK single-instance uniqueness before flatpak-packaging's own tasks run, so it is the one that must own the choice; flatpak-packaging imports `winonlinux.app.APPLICATION_ID` into its manifest/desktop file/AppStream metadata rather than defining its own | The ID needs to change for a distribution/branding reason — this is a one-string rename, not an architectural reversal |
+| **D-22** | The **FreeRDP runtime version probe** is implemented exactly once, in `add-app-foundation` (`winonlinux.freerdp_probe`), cached per app session; `add-native-launcher` calls it rather than re-probing | The OpenSpec proposal review (2026-09-14) found the probe specified twice with contradictory semantics — a per-app-session cache with "present but unknown" on unparseable output in app-foundation, versus a per-binary-path cache with re-probe-before-launch and fail-closed-on-unparseable in native-launcher's own draft. A single owner avoids two components disagreeing about whether a borderline FreeRDP install is usable | `add-native-launcher` needs a *fresher* probe than session-cached (e.g. FreeRDP was installed/upgraded mid-session) — in which case the fix is an explicit re-probe entry point on the existing module, not a second implementation |
+| **D-23** | Dependencies are pinned by a **`pip-compile`-generated `constraints.txt`**: CI installs with it, the Flatpak manifest (D-3) consumes it as its pinned module list, and declared floors exclude known-CVE versions (`requests>=2.32.4`). Floors + constraints, deliberately **not** upper version bounds (caps rot) and not a per-tool lockfile | One artifact makes the tested set and the shipped set identical, keeps `pip install -e .` workflows intact for contributors, and gives the Flatpak manifest a flat pinned list to consume; CI's `pip-audit` step flags CVEs that appear between deliberate regenerations (add-audit-test-coverage change, 2026-09-27, audit F-12) | Flatpak manifest generation adopts a tool that consumes a different pin format |
 
 ### 14.2 Identity and security
 

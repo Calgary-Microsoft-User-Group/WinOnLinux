@@ -1,0 +1,15 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('11111111-2222-3333-4444-555555555555')/cloudPCs",
+  "value": [
+    {
+      "id": "33333333-3333-3333-3333-333333333333",
+      "displayName": "Finance Shared Cloud PC",
+      "status": "inGracePeriod",
+      "provisioningType": "shared",
+      "imageDisplayName": "Windows 11 Enterprise + Microsoft 365 Apps",
+      "managedDeviceName": "CPC-FINANCE-03",
+      "servicePlanName": "Windows 365 Enterprise 2 vCPU/8 GB/128 GB",
+      "userPrincipalName": "kevin@example.onmicrosoft.com"
+    }
+  ]
+}
