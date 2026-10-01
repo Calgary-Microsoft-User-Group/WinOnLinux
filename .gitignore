@@ -6,3 +6,4 @@ venv/
 *.egg-info/
 .flatpak-builder/
 builddir/
+infra/dev-vm/.vm-credentials.txt
